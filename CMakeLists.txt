@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+project(dnsfilter CXX)
+set(CMAKE_CXX_STANDARD 20)
+add_compile_options(-Wall -Wextra -g -fsanitize=undefined)
+add_link_options(-fsanitize=undefined)
+add_executable(dnsfilter src/main.cpp)
