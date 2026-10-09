@@ -57,30 +57,31 @@ int main() {
     //    n      = how many bytes actually arrived. ALWAYS trust n, never
     //             sizeof(buf): only the first n bytes are real data.
     uint8_t buf[4096];           // big enough for EDNS0-sized packets
-    sockaddr_in client{};
-    socklen_t client_len = sizeof client;
-    ssize_t n = recvfrom(fd, buf, sizeof buf, 0,
-                         reinterpret_cast<sockaddr*>(&client), &client_len);
-    if (n < 0) {
-        std::perror("recvfrom");
-        close(fd);
-        return 1;
-    }
+    while (true) {
+        sockaddr_in client{};
+        socklen_t client_len = sizeof client;
+        ssize_t n = recvfrom(fd, buf, sizeof buf, 0,
+                             reinterpret_cast<sockaddr*>(&client), &client_len);
+        if (n < 0) {
+            std::perror("recvfrom");
+            continue;
+        }
 
     // 5. Print who sent it. inet_ntop turns the binary IP into text.
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client.sin_addr, ip, sizeof ip);
-    std::printf("Received %zd bytes from %s:%u\n\n", n, ip, ntohs(client.sin_port));
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client.sin_addr, ip, sizeof ip);
+        std::printf("Received %zd bytes from %s:%u\n\n", n, ip, ntohs(client.sin_port));
 
     // 6. Hex dump: each byte as two hex digits, 16 bytes per row.
     //    The left column is the offset (position) of the row's first byte,
     //    which makes it easy to say "the header is bytes 0-11".
-    for (ssize_t i = 0; i < n; ++i) {
-        if (i % 16 == 0) std::printf("%04zx:  ", static_cast<size_t>(i));
-        std::printf("%02x ", buf[i]);
-        if ((i + 1) % 16 == 0) std::printf("\n");
+        for (ssize_t i = 0; i < n; ++i) {
+            if (i % 16 == 0) std::printf("%04zx:  ", static_cast<size_t>(i));
+            std::printf("%02x ", buf[i]);
+            if ((i + 1) % 16 == 0) std::printf("\n");
+        }
+        std::printf("\n");
     }
-    std::printf("\n");
 
     // 7. Release the socket. (The OS would do this on exit anyway, but
     //    cleaning up explicitly is a good habit for the long-running server.)
