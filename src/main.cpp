@@ -10,6 +10,7 @@
 #include <unistd.h>       // close
 #include <string>
 #include <cctype>
+#include <cstring>
 
 #include <cstdint>        // uint8_t, uint16_t
 #include <cstdio>         // printf, perror
@@ -118,6 +119,21 @@ int main() {
         }
         uint16_t qtype = (buf[pos] << 8)| buf[pos + 1];
         std::printf("Qtype=%u\n\n", static_cast<unsigned>(qtype));
+        ssize_t question_end = pos + 4;                      // name + QTYPE (2) + QCLASS (2)
+
+        if (name == "blocked.test") {
+            uint8_t resp[4096];
+            std::memcpy(resp, buf, question_end);            // copy header + question
+            uint16_t resp_flags = 0x8000 | (flags & 0x0100) | 0x0080 | 0x0003;
+            resp[2] = resp_flags >> 8;                       // write flags back, high byte first
+            resp[3] = resp_flags & 0xFF;
+            std::memset(&resp[6], 0, 6);                     // ANCOUNT, NSCOUNT, ARCOUNT = 0
+            sendto(fd, resp, question_end, 0, reinterpret_cast<sockaddr*>(&client), client_len);
+            std::printf("BLOCKED %s -> NXDOMAIN\n\n", name.c_str());
+        }
+        else {
+            std::printf("Allowed %s (forwarding not built yet)\n\n", name.c_str());
+        }
     }
 
     // 7. Release the socket. (The OS would do this on exit anyway, but
