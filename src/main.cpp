@@ -81,6 +81,15 @@ int main() {
             if ((i + 1) % 16 == 0) std::printf("\n");
         }
         std::printf("\n");
+
+        if (n < 12) {                                                // a DNS header is 12 bytes
+            std::printf("Too short for a DNS header, skilling/n/n");
+            continue;
+        }
+        uint16_t id    = (buf[0] << 8) | buf[1];                     // bytes 0-1: transaction ID
+        uint16_t flags = (buf[2] << 8) | buf[3];                      // bytes 2-3: flags
+        bool rd = (flags & 0x0100) != 0;                             // RD = "recursion desired"
+        std::printf("ID=%u RD=%d\n\n", static_cast<unsigned>(id), rd ? 1 : 0);
     }
 
     // 7. Release the socket. (The OS would do this on exit anyway, but
