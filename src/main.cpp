@@ -8,6 +8,7 @@
 #include <netinet/in.h>   // sockaddr_in, INADDR_LOOPBACK
 #include <sys/socket.h>   // socket, bind, recvfrom
 #include <unistd.h>       // close
+#include <string>
 
 #include <cstdint>        // uint8_t, uint16_t
 #include <cstdio>         // printf, perror
@@ -90,6 +91,30 @@ int main() {
         uint16_t flags = (buf[2] << 8) | buf[3];                      // bytes 2-3: flags
         bool rd = (flags & 0x0100) != 0;                             // RD = "recursion desired"
         std::printf("ID=%u RD=%d\n\n", static_cast<unsigned>(id), rd ? 1 : 0);
+
+        std::string name;          // the domain name we're building, e.g. "example.com"
+        ssize_t pos = 12;          // the question section starts right after the 12-byte header
+        bool ok = false;           // becomes true only if we reach the 00 terminator safely
+        while (pos < n) {
+            uint8_t len = buf[pos];                          // the length byte
+            if (len == 0) { ok = true; ++pos; break; }       // end of name
+            if (len > 63 || pos + 1 + len > n) break;        // label too long, or runs past the packet
+            if (!name.empty()) name += '.';                  // dot between labels
+            name.append(reinterpret_cast<const char*>(&buf[pos + 1]), len);
+            pos += 1 + len;                                  // jump to the next length byte
+        }
+        if (!ok || name.size() > 253) {
+            std::printf("Malformed name, skipping\n\n");
+            continue;
+        }
+        std::printf("Name=%s\n\n", name.c_str());
+
+        if (pos + 4 > n) {
+            std::printf("Truncated question for %s (no QTYPE/QCLASS), skipping \n\n", name.c_str());
+            continue;
+        }
+        uint16_t qtype = (buf[pos] << 8)| buf[pos + 1];
+        std::printf("Qtype=%u\n\n", static_cast<unsigned>(qtype));
     }
 
     // 7. Release the socket. (The OS would do this on exit anyway, but
