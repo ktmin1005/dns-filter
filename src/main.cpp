@@ -9,6 +9,7 @@
 #include <sys/socket.h>   // socket, bind, recvfrom
 #include <unistd.h>       // close
 #include <string>
+#include <cctype>
 
 #include <cstdint>        // uint8_t, uint16_t
 #include <cstdio>         // printf, perror
@@ -100,7 +101,9 @@ int main() {
             if (len == 0) { ok = true; ++pos; break; }       // end of name
             if (len > 63 || pos + 1 + len > n) break;        // label too long, or runs past the packet
             if (!name.empty()) name += '.';                  // dot between labels
-            name.append(reinterpret_cast<const char*>(&buf[pos + 1]), len);
+            for (int i = 0; i < len; i++) {
+                name.push_back(static_cast<char>(std::tolower(buf[pos + 1 + i])));
+            }
             pos += 1 + len;                                  // jump to the next length byte
         }
         if (!ok || name.size() > 253) {
