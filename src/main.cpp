@@ -92,6 +92,20 @@ int main() {
         uint16_t id    = (buf[0] << 8) | buf[1];                     // bytes 0-1: transaction ID
         uint16_t flags = (buf[2] << 8) | buf[3];                      // bytes 2-3: flags
         bool rd = (flags & 0x0100) != 0;                             // RD = "recursion desired"
+        if (flags & 0x8000) {
+            std::printf("Not a query (QR=1), ignoring\n\n");
+            continue;
+        }
+        uint16_t opcode = (flags >> 11) & 0xF;
+        if (opcode != 0) {
+            std::printf("Unsupported opcode %u, ignoring\n\n", static_cast<unsigned>(opcode));
+            continue;
+        }
+        uint16_t qdcount = (buf[4] << 8) | buf[5];
+        if (qdcount != 1) {
+            std::printf("Expected 1 question, got %u, ignoring\n\n", static_cast<unsigned>(qdcount));
+            continue;
+        }
         std::printf("ID=%u RD=%d\n\n", static_cast<unsigned>(id), rd ? 1 : 0);
 
         std::string name;          // the domain name we're building, e.g. "example.com"
