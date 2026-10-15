@@ -15,6 +15,7 @@
 #include <cstdint>        // uint8_t, uint16_t
 #include <cstdio>         // printf, perror
 #include <sys/time.h>
+#include "blocklist.hpp"
 
 static void send_error(int fd, const uint8_t* query, ssize_t question_end, uint16_t query_flags, uint16_t rcode, const sockaddr_in& client, socklen_t client_len) {
     uint8_t resp[4096];
@@ -90,6 +91,14 @@ int main() {
     if (connect(up, reinterpret_cast<sockaddr*>(&upstream), sizeof upstream) < 0) {
         std::perror("connect upstream"); close(up); close(fd); return 1;
     }
+    Blocklist blocklist;
+    if (!blocklist.load("blocklist.txt")) {
+        std::fprintf(stderr, "Cannot open blocklist.txt\n");
+        close(up); close(fd); return 1;
+    }
+    std::printf("Loaded %zu blocked domains (%zu invalid lines skipped)\n",
+                blocklist.size(), blocklist.skipped());
+    if (blocklist.hit_limit()) std::fprintf(stderr, "Warning: blocklist truncated at entry limit\n");
     uint8_t buf[4096];           // big enough for EDNS0-sized packets
     while (true) {
         sockaddr_in client{};
@@ -166,7 +175,7 @@ int main() {
         std::printf("Qtype=%u\n\n", static_cast<unsigned>(qtype));
         ssize_t question_end = pos + 4;                      // name + QTYPE (2) + QCLASS (2)
 
-        if (name == "blocked.test") {
+        if (blocklist.is_blocked(name)) {
             send_error(fd, buf, question_end, flags, 3, client, client_len);
             std::printf("BLOCKED %s -> NXDOMAIN\n\n", name.c_str());
         }

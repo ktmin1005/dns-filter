@@ -1,0 +1,13 @@
+# Test blocklist: valid entries
+blocked.test
+doubleclick.net
+0.0.0.0 ads.example.org
+127.0.0.1 tracker.test   # inline comment
+
+# Deliberately invalid: all of these must be skipped
+com
+bad..entry
+-bad.test
+0.0.0.0 0.0.0.0
+192.168.1.5 sneaky.test
+
