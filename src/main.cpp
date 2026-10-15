@@ -14,6 +14,19 @@
 
 #include <cstdint>        // uint8_t, uint16_t
 #include <cstdio>         // printf, perror
+#include <sys/time.h>
+
+static void send_error(int fd, const uint8_t* query, ssize_t question_end, uint16_t query_flags, uint16_t rcode, const sockaddr_in& client, socklen_t client_len) {
+    uint8_t resp[4096];
+    std::memcpy(resp, query, question_end);
+    uint16_t f = 0x8000 | (query_flags & 0x0100) | 0x0080 | rcode;
+    resp[2] = f >> 8;
+    resp[3] = f & 0xFF;
+    std::memset(&resp[6], 0, 6);
+    if (sendto(fd, resp, question_end, 0, reinterpret_cast<const sockaddr*>(&client), client_len) < 0) {
+        std::perror("sendto (error reply)");
+    }
+}
 
 int main() {
     // Port 5300 for development: ports below 1024 (like DNS's real port 53)
@@ -59,6 +72,24 @@ int main() {
     //    client = filled in with the sender's address (who to reply to later)
     //    n      = how many bytes actually arrived. ALWAYS trust n, never
     //             sizeof(buf): only the first n bytes are real data.
+    int up = socket(AF_INET, SOCK_DGRAM, 0);
+    if (up < 0) { std::perror("upstream socket"); close(fd); return 1; }
+
+    timeval tv{};
+    tv.tv_sec = 2;
+    if (setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0) {
+        std::perror("setsockopt"); close(up); close(fd); return 1;
+    }
+
+    sockaddr_in upstream{};
+    upstream.sin_family = AF_INET;
+    upstream.sin_port = htons(53);
+    if (inet_pton(AF_INET, "1.1.1.1", &upstream.sin_addr) != 1) {
+        std::fprintf(stderr, "Invalid upstream address\n"); close(up); close(fd); return 1;
+    }
+    if (connect(up, reinterpret_cast<sockaddr*>(&upstream), sizeof upstream) < 0) {
+        std::perror("connect upstream"); close(up); close(fd); return 1;
+    }
     uint8_t buf[4096];           // big enough for EDNS0-sized packets
     while (true) {
         sockaddr_in client{};
@@ -136,22 +167,43 @@ int main() {
         ssize_t question_end = pos + 4;                      // name + QTYPE (2) + QCLASS (2)
 
         if (name == "blocked.test") {
-            uint8_t resp[4096];
-            std::memcpy(resp, buf, question_end);            // copy header + question
-            uint16_t resp_flags = 0x8000 | (flags & 0x0100) | 0x0080 | 0x0003;
-            resp[2] = resp_flags >> 8;                       // write flags back, high byte first
-            resp[3] = resp_flags & 0xFF;
-            std::memset(&resp[6], 0, 6);                     // ANCOUNT, NSCOUNT, ARCOUNT = 0
-            sendto(fd, resp, question_end, 0, reinterpret_cast<sockaddr*>(&client), client_len);
+            send_error(fd, buf, question_end, flags, 3, client, client_len);
             std::printf("BLOCKED %s -> NXDOMAIN\n\n", name.c_str());
         }
         else {
-            std::printf("Allowed %s (forwarding not built yet)\n\n", name.c_str());
+            if (send(up, buf, n, 0) != n) {
+                std::printf("Upstream send failed for %s -> SERVFAIL\n\n", name.c_str());
+                send_error(fd, buf, question_end, flags, 2, client, client_len);
+                continue;
+            }
+            uint8_t reply[4098];
+            ssize_t m = -1;
+
+            for (int attempt = 0; attempt < 4; ++attempt) {  // skip at most a few stale replies
+                ssize_t r = recv(up, reply, sizeof reply, 0);
+                if (r < 0) break;                            // timeout or error: give up
+                bool match = r >= question_end
+                          && reply[0] == buf[0] && reply[1] == buf[1]     // same ID
+                          && (reply[2] & 0x80)                            // QR=1: a response
+                          && std::memcmp(reply + 12, buf + 12, question_end - 12) == 0;
+                if (match) { m = r; break; }                 // the real answer
+            }
+            if (m < 0) {
+                std::printf("Upstream failed for %s -> SERVFAIL\n\n", name.c_str());
+                send_error(fd, buf, question_end, flags, 2, client, client_len);
+                continue;
+            }
+            if (sendto(fd, reply, m, 0, reinterpret_cast<sockaddr*>(&client), client_len) < 0) {
+                std::perror("sendto (forwarded reply)");
+                continue;
+            }
+            std::printf("FORWARDED %s (%zd-byte reply)\n\n", name.c_str(), m);
         }
     }
 
     // 7. Release the socket. (The OS would do this on exit anyway, but
     //    cleaning up explicitly is a good habit for the long-running server.)
+    close(up);
     close(fd);
     return 0;
 }
