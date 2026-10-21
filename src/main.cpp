@@ -29,11 +29,18 @@ static void send_error(int fd, const uint8_t* query, ssize_t question_end, uint1
     }
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+
+    if (argc > 2) {
+        std::fprintf(stderr, "Usage: %s [blocklist-file]\n", argv[0]);
+        return 1;
+    }
+    const char* list_path = (argc == 2) ? argv[1] : "blocklist.txt";
     // Port 5300 for development: ports below 1024 (like DNS's real port 53)
     // need root, and 5353 is already used by avahi (mDNS).
     constexpr uint16_t kPort = 5300;
 
+    constexpr bool kDebug = false;
     // 1. Create a socket.
     //    AF_INET    = IPv4
     //    SOCK_DGRAM = UDP (DNS queries normally travel over UDP)
@@ -92,8 +99,8 @@ int main() {
         std::perror("connect upstream"); close(up); close(fd); return 1;
     }
     Blocklist blocklist;
-    if (!blocklist.load("blocklist.txt")) {
-        std::fprintf(stderr, "Cannot open blocklist.txt\n");
+    if (!blocklist.load(list_path)) {
+        std::fprintf(stderr, "Cannot open blocklist: %s\n", list_path);
         close(up); close(fd); return 1;
     }
     std::printf("Loaded %zu blocked domains (%zu invalid lines skipped)\n",
@@ -113,17 +120,21 @@ int main() {
     // 5. Print who sent it. inet_ntop turns the binary IP into text.
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client.sin_addr, ip, sizeof ip);
-        std::printf("Received %zd bytes from %s:%u\n\n", n, ip, ntohs(client.sin_port));
+        if (kDebug) {
+            std::printf("Received %zd bytes from %s:%u\n\n", n, ip, ntohs(client.sin_port));
+        }
 
     // 6. Hex dump: each byte as two hex digits, 16 bytes per row.
     //    The left column is the offset (position) of the row's first byte,
     //    which makes it easy to say "the header is bytes 0-11".
-        for (ssize_t i = 0; i < n; ++i) {
-            if (i % 16 == 0) std::printf("%04zx:  ", static_cast<size_t>(i));
-            std::printf("%02x ", buf[i]);
-            if ((i + 1) % 16 == 0) std::printf("\n");
+        if (kDebug) {
+            for (ssize_t i = 0; i < n; ++i) {
+                if (i % 16 == 0) std::printf("%04zx:  ", static_cast<size_t>(i));
+                std::printf("%02x ", buf[i]);
+                if ((i + 1) % 16 == 0) std::printf("\n");
+            }
+            std::printf("\n");
         }
-        std::printf("\n");
 
         if (n < 12) {                                                // a DNS header is 12 bytes
             std::printf("Too short for a DNS header, skilling/n/n");
@@ -146,7 +157,10 @@ int main() {
             std::printf("Expected 1 question, got %u, ignoring\n\n", static_cast<unsigned>(qdcount));
             continue;
         }
-        std::printf("ID=%u RD=%d\n\n", static_cast<unsigned>(id), rd ? 1 : 0);
+        if (kDebug) {
+            std::printf("ID=%u RD=%d\n\n", static_cast<unsigned>(id), rd ? 1 : 0);
+        }
+
 
         std::string name;          // the domain name we're building, e.g. "example.com"
         ssize_t pos = 12;          // the question section starts right after the 12-byte header
@@ -165,14 +179,19 @@ int main() {
             std::printf("Malformed name, skipping\n\n");
             continue;
         }
-        std::printf("Name=%s\n\n", name.c_str());
+        if (kDebug) {
+            std::printf("Name=%s\n\n", name.c_str());
+        }
 
         if (pos + 4 > n) {
             std::printf("Truncated question for %s (no QTYPE/QCLASS), skipping \n\n", name.c_str());
             continue;
         }
         uint16_t qtype = (buf[pos] << 8)| buf[pos + 1];
-        std::printf("Qtype=%u\n\n", static_cast<unsigned>(qtype));
+        if (kDebug) {
+            std::printf("Qtype=%u\n\n", static_cast<unsigned>(qtype));
+        }
+
         ssize_t question_end = pos + 4;                      // name + QTYPE (2) + QCLASS (2)
 
         if (blocklist.is_blocked(name)) {
