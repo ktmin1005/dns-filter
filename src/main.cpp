@@ -6,6 +6,7 @@
 // NXDOMAIN (blocked) or forwards it upstream and relays the reply.
 //
 // Shared state and why it's safe:
+//   - Allow-list and RateLimiter: used only by the receiver thread.
 //   - WorkQueue: protected by its own mutex.
 //   - Blocklist: loaded before any thread starts, then only read (const).
 //     Concurrent reads of an unmodified container are safe.
@@ -22,6 +23,7 @@
 #include <unistd.h>       // close
 
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
@@ -35,6 +37,7 @@
 #include <utility>
 #include <vector>
 
+#include "access_control.hpp"
 #include "blocklist.hpp"
 #include "dns_parser.hpp"
 #include "work_queue.hpp"
@@ -48,6 +51,16 @@ constexpr int kUpstreamTimeoutSec = 2;
 constexpr int kMaxReplyReads = 4;         // bound on stale/bogus replies skipped
 constexpr unsigned kWorkers = 4;          // one per Pi 400 core; tune by benchmark
 constexpr std::size_t kQueueCapacity = 256;   // max queued queries (~1 MB worst case)
+
+// Only these subnets may use the server. Everything else is dropped silently.
+// The second entry MUST match your home network -- check with: ip -4 addr show
+constexpr const char* kAllowedNets[] = {"127.0.0.0/8", "10.0.0.0/24"};
+
+// Per-client rate limit: bursts of up to 100 queries, refilled at 50 per second.
+// A page load is typically a few dozen lookups, so normal use never hits this.
+constexpr double kRatePerSec = 50.0;
+constexpr double kBurst = 100.0;
+constexpr std::size_t kMaxTrackedClients = 1024;
 
 constexpr uint16_t kRcodeServfail = 2;
 constexpr uint16_t kRcodeNxdomain = 3;
@@ -67,6 +80,8 @@ struct Job {
 
 struct Stats {
     std::atomic<uint64_t> received{0};
+    std::atomic<uint64_t> denied{0};      // source not in an allowed subnet
+    std::atomic<uint64_t> rate_limited{0};
     std::atomic<uint64_t> dropped{0};     // queue full
     std::atomic<uint64_t> rejected{0};    // failed validation
     std::atomic<uint64_t> blocked{0};
@@ -242,6 +257,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // ---- Access control -----------------------------------------------------
+    std::vector<Ipv4Net> allowed;
+    for (const char* text : kAllowedNets) {
+        Ipv4Net n;
+        if (!parse_ipv4_net(text, n)) {
+            std::fprintf(stderr, "Invalid allowed subnet: %s\n", text);
+            return 1;
+        }
+        allowed.push_back(n);
+    }
+    RateLimiter limiter(kRatePerSec, kBurst, kMaxTrackedClients);
+
     // ---- Client-facing socket -------------------------------------------------
     int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (client_fd < 0) { std::perror("socket"); return 1; }
@@ -303,6 +330,25 @@ int main(int argc, char* argv[]) {
             continue;
         }
         ++stats.received;
+
+        // Access control happens here, before any parsing or queueing, so
+        // unwanted traffic costs almost nothing. Denied packets are counted,
+        // not logged: logging each one would let a flood fill the log.
+        if (job.client_len != sizeof(sockaddr_in) || job.client.sin_family != AF_INET) {
+            ++stats.denied;
+            continue;
+        }
+        const uint32_t src = ntohl(job.client.sin_addr.s_addr);
+        bool permitted = false;
+        for (const Ipv4Net& net : allowed) {
+            if (net_contains(net, src)) { permitted = true; break; }
+        }
+        if (!permitted) { ++stats.denied; continue; }
+        if (!limiter.allow(src, RateLimiter::Clock::now())) {
+            ++stats.rate_limited;
+            continue;
+        }
+
         job.packet.assign(buf, buf + n);
         if (!queue.try_push(std::move(job))) {
             // Queue full: drop rather than reply, so a flood can't turn this
@@ -317,9 +363,11 @@ int main(int argc, char* argv[]) {
     for (std::thread& t : workers) t.join();
     close_all(client_fd, upstreams);
 
-    std::printf("Stats: received=%llu dropped=%llu rejected=%llu blocked=%llu "
-                "forwarded=%llu servfail=%llu\n",
+    std::printf("Stats: received=%llu denied=%llu rate_limited=%llu dropped=%llu "
+                "rejected=%llu blocked=%llu forwarded=%llu servfail=%llu\n",
                 static_cast<unsigned long long>(stats.received.load()),
+                static_cast<unsigned long long>(stats.denied.load()),
+                static_cast<unsigned long long>(stats.rate_limited.load()),
                 static_cast<unsigned long long>(stats.dropped.load()),
                 static_cast<unsigned long long>(stats.rejected.load()),
                 static_cast<unsigned long long>(stats.blocked.load()),
