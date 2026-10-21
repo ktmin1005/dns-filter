@@ -13,11 +13,18 @@
 //   - Client socket: sendto() on one UDP socket from several threads is safe;
 //     each call sends one complete datagram.
 //   - Stats: std::atomic counters.
-//   - Each worker has its OWN upstream socket, so replies can never be
-//     delivered to the wrong worker.
+//   - Upstream sockets: each query gets a brand-new socket (fresh random
+//     source port) and a fresh random query ID, so replies can never reach
+//     the wrong worker and off-path spoofing must guess both. See
+//     forward_upstream().
+//   - Stop flag: a lock-free std::atomic<bool>, safe to set from a signal
+//     handler and read from another thread.
 
 #include <arpa/inet.h>    // htons, inet_pton, inet_ntop
 #include <netinet/in.h>   // sockaddr_in
+#include <pthread.h>      // pthread_sigmask
+#include <signal.h>       // sigset_t, sigaction
+#include <sys/random.h>   // getrandom
 #include <sys/socket.h>   // socket, bind, connect, send, recv, sendto, recvfrom
 #include <sys/time.h>     // timeval
 #include <unistd.h>       // close
@@ -80,11 +87,46 @@ constexpr std::size_t kMaxTrackedClients = 1024;
 constexpr uint16_t kRcodeServfail = 2;
 constexpr uint16_t kRcodeNxdomain = 3;
 
-// Set by the signal handler on Ctrl+C (SIGINT) or SIGTERM. sig_atomic_t is
-// the only type the C++ standard guarantees is safe to write from a handler.
-volatile std::sig_atomic_t g_stop = 0;
+// How long clients may cache a "blocked" answer. Longer means fewer repeat
+// queries for the same tracker; shorter means allowlist changes reach clients
+// sooner. 60 seconds balances the two.
+constexpr uint32_t kBlockedTtl = 60;
 
-extern "C" void handle_stop_signal(int) { g_stop = 1; }
+// A synthetic SOA record, appended to the authority section of every block
+// reply. RFC 2308: a resolver may cache a "no such domain" answer only if it
+// carries a SOA record, for min(record TTL, SOA MINIMUM). Without one, apps
+// re-ask for blocked domains over and over.
+// The names use ".invalid", a top-level domain reserved so it can never exist.
+constexpr uint8_t kBlockedSoa[] = {
+    0xC0, 0x0C,                         // owner: pointer to the question name (offset 12)
+    0x00, 0x06,                         // TYPE  = SOA
+    0x00, 0x01,                         // CLASS = IN
+    0x00, 0x00, 0x00, kBlockedTtl,      // TTL (fits in one byte: 60 < 256)
+    0x00, 67,                           // RDLENGTH: 18 + 29 + 20 bytes below
+    // MNAME: sinkhole.invalid.  (18 bytes)
+    8, 's','i','n','k','h','o','l','e', 7, 'i','n','v','a','l','i','d', 0,
+    // RNAME: hostmaster.sinkhole.invalid.  (29 bytes)
+    10, 'h','o','s','t','m','a','s','t','e','r',
+    8, 's','i','n','k','h','o','l','e', 7, 'i','n','v','a','l','i','d', 0,
+    // SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM  (5 x 4 bytes)
+    0x00, 0x00, 0x00, 0x01,             // SERIAL  = 1
+    0x00, 0x00, 0x0E, 0x10,             // REFRESH = 3600
+    0x00, 0x00, 0x02, 0x58,             // RETRY   = 600
+    0x00, 0x01, 0x51, 0x80,             // EXPIRE  = 86400
+    0x00, 0x00, 0x00, kBlockedTtl,      // MINIMUM = negative-cache lifetime
+};
+static_assert(kBlockedTtl < 256, "TTL is encoded in a single byte above");
+static_assert(sizeof(kBlockedSoa) == 12 + 67, "SOA record length must match RDLENGTH");
+
+// Set by the signal handler on Ctrl+C (SIGINT) or SIGTERM, read by the
+// receiver thread. A lock-free atomic is both async-signal-safe and safe to
+// share between threads; `volatile sig_atomic_t` is only guaranteed for a
+// handler and code on the SAME thread, so it would be a data race here.
+std::atomic<bool> g_stop{false};
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "the stop flag must be lock-free to be set from a signal handler");
+
+extern "C" void handle_stop_signal(int) { g_stop.store(true); }
 
 // One received packet waiting to be handled.
 struct Job {
@@ -104,11 +146,13 @@ struct Stats {
     std::atomic<uint64_t> servfail{0};
 };
 
-// Sends a reply containing only the header and question, with the given RCODE.
-// parse_query() guarantees q.question_end <= the packet length <= 4096,
-// so the copy can't overflow `resp`.
+// Sends a reply containing the header and question with the given RCODE and,
+// for blocked names, the synthetic SOA record so clients can cache the block.
+// parse_query() guarantees q.question_end <= the packet length <= 4096, and
+// limits names to 253 characters, so question_end is at most a few hundred
+// bytes; the explicit size check below enforces the bound anyway.
 void send_error(int fd, const uint8_t* query, const DnsQuery& q, uint16_t rcode,
-                const sockaddr_in& client, socklen_t client_len) {
+                bool with_soa, const sockaddr_in& client, socklen_t client_len) {
     uint8_t resp[4096];
     std::memcpy(resp, query, q.question_end);
     // QR=1, copy RD, RA=1, RCODE. Opcode 0, AA/TC/AD all 0.
@@ -116,7 +160,14 @@ void send_error(int fd, const uint8_t* query, const DnsQuery& q, uint16_t rcode,
     resp[2] = static_cast<uint8_t>(f >> 8);
     resp[3] = static_cast<uint8_t>(f & 0xFF);
     std::memset(&resp[6], 0, 6);            // ANCOUNT, NSCOUNT, ARCOUNT = 0
-    if (sendto(fd, resp, q.question_end, 0,
+
+    std::size_t len = q.question_end;
+    if (with_soa && len + sizeof kBlockedSoa <= sizeof resp) {
+        std::memcpy(resp + len, kBlockedSoa, sizeof kBlockedSoa);
+        len += sizeof kBlockedSoa;
+        resp[9] = 1;                        // NSCOUNT = 1 (low byte; high byte is 0)
+    }
+    if (sendto(fd, resp, len, 0,
                reinterpret_cast<const sockaddr*>(&client), client_len) < 0) {
         std::perror("sendto (error reply)");
     }
@@ -130,6 +181,15 @@ void hex_dump(const uint8_t* data, std::size_t len) {
     }
     std::printf("\n");
 }
+
+// Closes a file descriptor when it goes out of scope, on every return path.
+struct FdGuard {
+    int fd;
+    explicit FdGuard(int f) : fd(f) {}
+    ~FdGuard() { if (fd >= 0) close(fd); }
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+};
 
 // Creates a UDP socket connected to the upstream resolver, with a receive
 // timeout. Returns -1 (after printing why) on any failure.
@@ -158,7 +218,7 @@ int make_upstream_socket() {
 }
 
 // Handles one query from start to finish. Runs on a worker thread.
-void handle_job(const Job& job, int client_fd, int up,
+void handle_job(const Job& job, int client_fd,
                 const Blocklist& blocklist, Stats& stats) {
     const uint8_t* buf = job.packet.data();
     const std::size_t n = job.packet.size();
@@ -187,27 +247,44 @@ void handle_job(const Job& job, int client_fd, int up,
 
     // ---- Blocked: answer NXDOMAIN ourselves ---------------------------------
     if (blocklist.is_blocked(q.name)) {
-        send_error(client_fd, buf, q, kRcodeNxdomain, job.client, job.client_len);
+        send_error(client_fd, buf, q, kRcodeNxdomain, true, job.client, job.client_len);
         ++stats.blocked;
         if (kLogQueries) std::printf("BLOCKED %s\n", q.name.c_str());
         return;
     }
 
     // ---- Allowed: forward upstream and relay the reply ----------------------
-    if (send(up, buf, n, 0) != static_cast<ssize_t>(n)) {
+    // Spoofing defense (the Kaminsky attack): an off-path attacker forging a
+    // reply from 1.1.1.1 must guess the query ID AND our source port. So each
+    // query gets a fresh socket -- a new random port from the kernel -- and a
+    // fresh random ID from the OS's secure random generator, instead of
+    // trusting whatever ID the client chose.
+    FdGuard up(make_upstream_socket());
+    uint16_t upstream_id = 0;
+    if (up.fd < 0 || getrandom(&upstream_id, sizeof upstream_id, 0) != sizeof upstream_id) {
+        ++stats.servfail;
+        std::printf("Upstream setup failed for %s -> SERVFAIL\n", q.name.c_str());
+        send_error(client_fd, buf, q, kRcodeServfail, false, job.client, job.client_len);
+        return;
+    }
+
+    std::vector<uint8_t> out(buf, buf + n);              // forwarded copy
+    out[0] = static_cast<uint8_t>(upstream_id >> 8);
+    out[1] = static_cast<uint8_t>(upstream_id & 0xFF);
+    if (send(up.fd, out.data(), out.size(), 0) != static_cast<ssize_t>(out.size())) {
         ++stats.servfail;
         std::printf("Upstream send failed for %s -> SERVFAIL\n", q.name.c_str());
-        send_error(client_fd, buf, q, kRcodeServfail, job.client, job.client_len);
+        send_error(client_fd, buf, q, kRcodeServfail, false, job.client, job.client_len);
         return;
     }
 
     uint8_t reply[4096];
     ssize_t m = -1;
     for (int attempt = 0; attempt < kMaxReplyReads; ++attempt) {
-        ssize_t r = recv(up, reply, sizeof reply, 0);
+        ssize_t r = recv(up.fd, reply, sizeof reply, 0);
         if (r < 0) break;                                       // timeout or error
         bool match = static_cast<std::size_t>(r) >= q.question_end     // checked first
-                  && reply[0] == buf[0] && reply[1] == buf[1]         // same ID
+                  && reply[0] == out[0] && reply[1] == out[1]         // our random ID
                   && (reply[2] & 0x80)                                // QR=1
                   && std::memcmp(reply + 12, buf + 12, q.question_end - 12) == 0;
         if (match) { m = r; break; }                            // stale/bogus: keep waiting
@@ -215,9 +292,11 @@ void handle_job(const Job& job, int client_fd, int up,
     if (m < 0) {
         ++stats.servfail;
         std::printf("Upstream failed for %s -> SERVFAIL\n", q.name.c_str());
-        send_error(client_fd, buf, q, kRcodeServfail, job.client, job.client_len);
+        send_error(client_fd, buf, q, kRcodeServfail, false, job.client, job.client_len);
         return;
     }
+    reply[0] = buf[0];                                          // restore the
+    reply[1] = buf[1];                                          // client's own ID
     if (sendto(client_fd, reply, static_cast<std::size_t>(m), 0,
                reinterpret_cast<const sockaddr*>(&job.client), job.client_len) < 0) {
         std::perror("sendto (forwarded reply)");
@@ -228,10 +307,10 @@ void handle_job(const Job& job, int client_fd, int up,
 }
 
 // A worker thread: take jobs until the queue is closed and empty.
-void worker_loop(WorkQueue<Job>& queue, int client_fd, int up,
+void worker_loop(WorkQueue<Job>& queue, int client_fd,
                  const Blocklist& blocklist, Stats& stats) {
     while (std::optional<Job> job = queue.pop()) {
-        handle_job(*job, client_fd, up, blocklist, stats);
+        handle_job(*job, client_fd, blocklist, stats);
     }
 }
 
@@ -246,11 +325,6 @@ void print_stats(const Stats& stats) {
                 static_cast<unsigned long long>(stats.blocked.load()),
                 static_cast<unsigned long long>(stats.forwarded.load()),
                 static_cast<unsigned long long>(stats.servfail.load()));
-}
-
-void close_all(int client_fd, const std::vector<int>& upstreams) {
-    for (int up : upstreams) close(up);
-    if (client_fd >= 0) close(client_fd);
 }
 
 }  // namespace
@@ -327,36 +401,55 @@ int main(int argc, char* argv[]) {
     if (bind(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
         std::perror("bind"); close(client_fd); return 1;
     }
-    // A 1-second receive timeout so the receiver re-checks g_stop regularly,
-    // even if the signal arrives on a different thread.
+    // A 1-second receive timeout so the receiver re-checks g_stop and the
+    // stats timer regularly, even when no queries arrive.
     timeval rtv{};
     rtv.tv_sec = 1;
     if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv) < 0) {
         std::perror("setsockopt (client timeout)"); close(client_fd); return 1;
     }
 
-    // ---- One upstream socket per worker ----------------------------------------
-    std::vector<int> upstreams;
-    for (unsigned i = 0; i < kWorkers; ++i) {
-        int up = make_upstream_socket();
-        if (up < 0) { close_all(client_fd, upstreams); return 1; }
-        upstreams.push_back(up);
+    // ---- Check the upstream address once, so a typo fails at startup -------
+    {
+        int probe = make_upstream_socket();
+        if (probe < 0) { close(client_fd); return 1; }
+        close(probe);
     }
 
     // ---- Start workers -----------------------------------------------------------
     WorkQueue<Job> queue(kQueueCapacity);
     Stats stats;
     std::vector<std::thread> workers;
+
+    // Block SIGINT/SIGTERM while creating workers: new threads inherit the
+    // mask, so these signals can only be delivered to this (receiver) thread,
+    // where they interrupt recvfrom() and stop the loop immediately.
+    sigset_t stop_signals, old_mask;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGINT);
+    sigaddset(&stop_signals, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &stop_signals, &old_mask) != 0) {
+        std::fprintf(stderr, "pthread_sigmask failed\n");
+        close(client_fd); return 1;
+    }
+    bool started = true;
     try {
         for (unsigned i = 0; i < kWorkers; ++i) {
-            workers.emplace_back(worker_loop, std::ref(queue), client_fd, upstreams[i],
+            workers.emplace_back(worker_loop, std::ref(queue), client_fd,
                                  std::cref(blocklist), std::ref(stats));
         }
     } catch (const std::system_error& e) {
         std::fprintf(stderr, "Failed to start worker thread: %s\n", e.what());
+        started = false;
+    }
+    if (pthread_sigmask(SIG_SETMASK, &old_mask, nullptr) != 0) {
+        std::fprintf(stderr, "pthread_sigmask restore failed\n");
+        started = false;
+    }
+    if (!started) {
         queue.close();
         for (std::thread& t : workers) t.join();
-        close_all(client_fd, upstreams);
+        close(client_fd);
         return 1;
     }
 
@@ -366,7 +459,7 @@ int main(int argc, char* argv[]) {
     // ---- Receiver loop (this thread) -------------------------------------------
     uint8_t buf[4096];
     auto next_stats = RateLimiter::Clock::now() + std::chrono::seconds(kStatsIntervalSec);
-    while (!g_stop) {
+    while (!g_stop.load()) {
         // The 1-second receive timeout guarantees this check runs regularly
         // even when no queries arrive.
         if (RateLimiter::Clock::now() >= next_stats) {
@@ -416,7 +509,7 @@ int main(int argc, char* argv[]) {
     std::printf("\nShutting down: finishing queued queries...\n");
     queue.close();                       // workers drain the queue, then exit
     for (std::thread& t : workers) t.join();
-    close_all(client_fd, upstreams);
+    close(client_fd);
 
     print_stats(stats);
     return 0;
