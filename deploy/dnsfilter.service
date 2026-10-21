@@ -1,0 +1,70 @@
+# /etc/systemd/system/dnsfilter.service -- runs the DNS filter as a sandboxed service.
+#
+# Check how locked-down it is with:  systemd-analyze security dnsfilter
+
+[Unit]
+Description=DNS filtering server
+Documentation=https://github.com/ktmin1005/dns-filter
+Wants=network-online.target
+After=network-online.target
+# Keep retrying forever if the network isn't ready yet at boot
+# (bind fails until the Pi has its address).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dnsfilter /etc/dnsfilter/blocklist.txt
+Restart=on-failure
+RestartSec=2
+
+# ---- Identity: a dedicated account with no login and no home ----------------
+User=dnsfilter
+Group=dnsfilter
+
+# ---- Privileges: exactly one, to bind port 53 ---------------------------------
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# ---- Network: may only talk to the home subnet and the upstream resolver ------
+# Enforced by the kernel (eBPF), independent of the program's own checks.
+RestrictAddressFamilies=AF_INET
+IPAddressDeny=any
+IPAddressAllow=10.0.0.0/24 1.1.1.1
+
+# ---- Filesystem: everything read-only or invisible ----------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+UMask=0077
+ProtectProc=invisible
+ProcSubset=pid
+
+# ---- Kernel and system: no way to change them -----------------------------------
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+
+# ---- System calls: only those ordinary services need ---------------------------
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# ---- Resource caps: a bug can't exhaust the Pi ---------------------------------
+MemoryMax=256M
+TasksMax=32
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target

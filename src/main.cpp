@@ -1,4 +1,4 @@
-// main.cpp -- multithreaded DNS filtering server.
+// main.cpp -- multithreaded DNS filtering server (deployed as a systemd service).
 //
 // One receiver thread reads queries from the client socket and places them
 // on a bounded queue. A fixed pool of worker threads takes queries off the
@@ -44,8 +44,17 @@
 
 namespace {
 
-constexpr uint16_t kPort = 5300;          // dev port; 53 at deployment
+// Where the server listens. Binding to the Pi's specific LAN address (not
+// 0.0.0.0) means it can't be reached through any other interface, such as a
+// VPN or a second network adapter. Requires a DHCP reservation for this IP.
+constexpr const char* kBindIp = "10.0.0.131";
+constexpr uint16_t kPort = 53;            // standard DNS port
 constexpr bool kDebug = false;            // true = hex dumps and parsed fields
+// Per-query log lines (BLOCKED/FORWARDED) record which domains each device
+// looks up -- other people's browsing, once they use this server. Off by
+// default; periodic counters are logged instead.
+constexpr bool kLogQueries = false;
+constexpr int kStatsIntervalSec = 300;    // log counters every 5 minutes
 constexpr const char* kUpstreamIp = "1.1.1.1";
 constexpr int kUpstreamTimeoutSec = 2;
 constexpr int kMaxReplyReads = 4;         // bound on stale/bogus replies skipped
@@ -53,8 +62,10 @@ constexpr unsigned kWorkers = 4;          // one per Pi 400 core; tune by benchm
 constexpr std::size_t kQueueCapacity = 256;   // max queued queries (~1 MB worst case)
 
 // Only these subnets may use the server. Everything else is dropped silently.
-// The second entry MUST match your home network -- check with: ip -4 addr show
-constexpr const char* kAllowedNets[] = {"127.0.0.0/8", "10.0.0.0/24"};
+// This MUST match your home network -- check with: ip -4 addr show
+// (Loopback isn't listed: the server only listens on the LAN address, and
+// the Pi's own queries to that address come from 10.0.0.131, which is inside.)
+constexpr const char* kAllowedNets[] = {"10.0.0.0/24"};
 
 // Per-client rate limit: bursts of up to 100 queries, refilled at 50 per second.
 // A page load is typically a few dozen lookups, so normal use never hits this.
@@ -174,7 +185,7 @@ void handle_job(const Job& job, int client_fd, int up,
     if (blocklist.is_blocked(q.name)) {
         send_error(client_fd, buf, q, kRcodeNxdomain, job.client, job.client_len);
         ++stats.blocked;
-        std::printf("BLOCKED %s\n", q.name.c_str());
+        if (kLogQueries) std::printf("BLOCKED %s\n", q.name.c_str());
         return;
     }
 
@@ -209,7 +220,7 @@ void handle_job(const Job& job, int client_fd, int up,
         return;
     }
     ++stats.forwarded;
-    std::printf("FORWARDED %s\n", q.name.c_str());
+    if (kLogQueries) std::printf("FORWARDED %s\n", q.name.c_str());
 }
 
 // A worker thread: take jobs until the queue is closed and empty.
@@ -220,6 +231,19 @@ void worker_loop(WorkQueue<Job>& queue, int client_fd, int up,
     }
 }
 
+void print_stats(const Stats& stats) {
+    std::printf("Stats: received=%llu denied=%llu rate_limited=%llu dropped=%llu "
+                "rejected=%llu blocked=%llu forwarded=%llu servfail=%llu\n",
+                static_cast<unsigned long long>(stats.received.load()),
+                static_cast<unsigned long long>(stats.denied.load()),
+                static_cast<unsigned long long>(stats.rate_limited.load()),
+                static_cast<unsigned long long>(stats.dropped.load()),
+                static_cast<unsigned long long>(stats.rejected.load()),
+                static_cast<unsigned long long>(stats.blocked.load()),
+                static_cast<unsigned long long>(stats.forwarded.load()),
+                static_cast<unsigned long long>(stats.servfail.load()));
+}
+
 void close_all(int client_fd, const std::vector<int>& upstreams) {
     for (int up : upstreams) close(up);
     if (client_fd >= 0) close(client_fd);
@@ -228,6 +252,11 @@ void close_all(int client_fd, const std::vector<int>& upstreams) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Under systemd, stdout goes to the journal through a pipe, which C makes
+    // fully buffered -- log lines could sit unseen for a long time, or be lost
+    // in a crash. Line buffering writes each line as soon as it's complete.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     // ---- Arguments ----------------------------------------------------------
     if (argc > 2) {
         std::fprintf(stderr, "Usage: %s [blocklist-file]\n", argv[0]);
@@ -276,7 +305,10 @@ int main(int argc, char* argv[]) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(kPort);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // only the Pi itself can reach it
+    if (inet_pton(AF_INET, kBindIp, &addr.sin_addr) != 1) {
+        std::fprintf(stderr, "Invalid bind address: %s\n", kBindIp);
+        close(client_fd); return 1;
+    }
     if (bind(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
         std::perror("bind"); close(client_fd); return 1;
     }
@@ -313,12 +345,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::printf("Listening on 127.0.0.1:%u with %u workers, forwarding to %s\n",
-                kPort, kWorkers, kUpstreamIp);
+    std::printf("Listening on %s:%u with %u workers, forwarding to %s\n",
+                kBindIp, kPort, kWorkers, kUpstreamIp);
 
     // ---- Receiver loop (this thread) -------------------------------------------
     uint8_t buf[4096];
+    auto next_stats = RateLimiter::Clock::now() + std::chrono::seconds(kStatsIntervalSec);
     while (!g_stop) {
+        // The 1-second receive timeout guarantees this check runs regularly
+        // even when no queries arrive.
+        if (RateLimiter::Clock::now() >= next_stats) {
+            print_stats(stats);
+            next_stats += std::chrono::seconds(kStatsIntervalSec);
+        }
+
         Job job;
         job.client_len = sizeof job.client;
         ssize_t n = recvfrom(client_fd, buf, sizeof buf, 0,
@@ -363,15 +403,6 @@ int main(int argc, char* argv[]) {
     for (std::thread& t : workers) t.join();
     close_all(client_fd, upstreams);
 
-    std::printf("Stats: received=%llu denied=%llu rate_limited=%llu dropped=%llu "
-                "rejected=%llu blocked=%llu forwarded=%llu servfail=%llu\n",
-                static_cast<unsigned long long>(stats.received.load()),
-                static_cast<unsigned long long>(stats.denied.load()),
-                static_cast<unsigned long long>(stats.rate_limited.load()),
-                static_cast<unsigned long long>(stats.dropped.load()),
-                static_cast<unsigned long long>(stats.rejected.load()),
-                static_cast<unsigned long long>(stats.blocked.load()),
-                static_cast<unsigned long long>(stats.forwarded.load()),
-                static_cast<unsigned long long>(stats.servfail.load()));
+    print_stats(stats);
     return 0;
 }
