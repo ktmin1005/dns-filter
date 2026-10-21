@@ -46,19 +46,20 @@ bool valid_domain(const std::string& s) {
     }
 }
 
-}  // namespace
-
-bool Blocklist::load(const std::string& path) {
+// Reads and validates one list file into `out`. Shared by the blocklist and
+// the allowlist so both get exactly the same validation and limits.
+bool load_list(const std::string& path, std::unordered_set<std::string>& out,
+               std::size_t& skipped, bool& hit_limit) {
     std::ifstream in(path);
     if (!in) return false;
 
-    domains_.clear();
-    skipped_ = 0;
-    hit_limit_ = false;
+    out.clear();
+    skipped = 0;
+    hit_limit = false;
 
     std::string line;
     while (std::getline(in, line)) {
-        if (line.size() > kMaxLineLength) { ++skipped_; continue; }
+        if (line.size() > kMaxLineLength) { ++skipped; continue; }
 
         // Strip comments: everything from '#' onward.
         if (std::size_t hash = line.find('#'); hash != std::string::npos) {
@@ -73,9 +74,9 @@ bool Blocklist::load(const std::string& path) {
         std::string domain = first;
         if (fields >> second) {
             // Hosts-file format: "<ip> <domain>". Only accept the sinkhole
-            // addresses blocklists use; anything else is not a block entry.
-            if (first != "0.0.0.0" && first != "127.0.0.1") { ++skipped_; continue; }
-            if (fields >> extra) { ++skipped_; continue; }  // more fields than expected
+            // addresses blocklists use; anything else is not a list entry.
+            if (first != "0.0.0.0" && first != "127.0.0.1") { ++skipped; continue; }
+            if (fields >> extra) { ++skipped; continue; }  // more fields than expected
             domain = second;
         }
 
@@ -84,22 +85,42 @@ bool Blocklist::load(const std::string& path) {
         }
         if (!domain.empty() && domain.back() == '.') domain.pop_back();  // "example.com."
 
-        if (!valid_domain(domain)) { ++skipped_; continue; }
+        if (!valid_domain(domain)) { ++skipped; continue; }
 
-        if (domains_.size() >= kMaxEntries) { hit_limit_ = true; break; }
-        domains_.insert(std::move(domain));
+        if (out.size() >= kMaxEntries) { hit_limit = true; break; }
+        out.insert(std::move(domain));
     }
     return true;
 }
 
-bool Blocklist::is_blocked(const std::string& name) const {
-    // Check the full name, then each parent domain, cutting only at dots:
-    // "a.ads.example.com" -> "ads.example.com" -> "example.com" -> "com".
+// True if `name` or any parent domain of it is in `set`, cutting only at dots:
+// "a.ads.example.com" -> "ads.example.com" -> "example.com" -> "com".
+bool matches_suffix(const std::unordered_set<std::string>& set, const std::string& name) {
+    if (set.empty()) return false;
     std::size_t pos = 0;
     while (true) {
-        if (domains_.count(name.substr(pos)) != 0) return true;
+        if (set.count(name.substr(pos)) != 0) return true;
         std::size_t dot = name.find('.', pos);
         if (dot == std::string::npos) return false;
         pos = dot + 1;
     }
+}
+
+}  // namespace
+
+bool Blocklist::load(const std::string& path) {
+    return load_list(path, blocked_, skipped_, hit_limit_);
+}
+
+bool Blocklist::load_allowlist(const std::string& path) {
+    bool allow_hit_limit = false;
+    bool ok = load_list(path, allowed_, allow_skipped_, allow_hit_limit);
+    if (allow_hit_limit) hit_limit_ = true;
+    return ok;
+}
+
+bool Blocklist::is_blocked(const std::string& name) const {
+    // The allowlist wins: it exists to correct false positives.
+    if (matches_suffix(allowed_, name)) return false;
+    return matches_suffix(blocked_, name);
 }

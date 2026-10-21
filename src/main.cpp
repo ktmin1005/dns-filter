@@ -67,10 +67,14 @@ constexpr std::size_t kQueueCapacity = 256;   // max queued queries (~1 MB worst
 // the Pi's own queries to that address come from 10.0.0.131, which is inside.)
 constexpr const char* kAllowedNets[] = {"10.0.0.0/24"};
 
-// Per-client rate limit: bursts of up to 100 queries, refilled at 50 per second.
-// A page load is typically a few dozen lookups, so normal use never hits this.
-constexpr double kRatePerSec = 50.0;
-constexpr double kBurst = 100.0;
+// Per-client rate limit: up to 1000 queries per minute (a burst of 1000,
+// refilled at 1000/60 per second). Measured on real browsing: a burst limit
+// of 100 throttled normal use -- a busy page plus background apps can issue
+// hundreds of lookups in seconds, and every dropped query triggers a client
+// retry, which makes the burst bigger. 1000/minute matches the default used
+// by Pi-hole and still stops a single device from flooding the server.
+constexpr double kRatePerSec = 1000.0 / 60.0;
+constexpr double kBurst = 1000.0;
 constexpr std::size_t kMaxTrackedClients = 1024;
 
 constexpr uint16_t kRcodeServfail = 2;
@@ -258,11 +262,12 @@ int main(int argc, char* argv[]) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
     // ---- Arguments ----------------------------------------------------------
-    if (argc > 2) {
-        std::fprintf(stderr, "Usage: %s [blocklist-file]\n", argv[0]);
+    if (argc > 3) {
+        std::fprintf(stderr, "Usage: %s [blocklist-file [allowlist-file]]\n", argv[0]);
         return 1;
     }
-    const char* list_path = (argc == 2) ? argv[1] : "blocklist.txt";
+    const char* list_path = (argc >= 2) ? argv[1] : "blocklist.txt";
+    const char* allow_path = (argc == 3) ? argv[2] : nullptr;   // optional
 
     // ---- Blocklist: loaded before any thread exists, never modified after ----
     Blocklist blocklist;
@@ -272,6 +277,16 @@ int main(int argc, char* argv[]) {
     }
     std::printf("Loaded %zu blocked domains (%zu invalid lines skipped)\n",
                 blocklist.size(), blocklist.skipped());
+    if (allow_path != nullptr) {
+        // An allowlist that was asked for but can't be read is an error, not
+        // something to silently ignore.
+        if (!blocklist.load_allowlist(allow_path)) {
+            std::fprintf(stderr, "Cannot open allowlist: %s\n", allow_path);
+            return 1;
+        }
+        std::printf("Loaded %zu allowed domains (%zu invalid lines skipped)\n",
+                    blocklist.allow_size(), blocklist.allow_skipped());
+    }
     if (blocklist.hit_limit()) {
         std::fprintf(stderr, "Warning: blocklist truncated at entry limit\n");
     }

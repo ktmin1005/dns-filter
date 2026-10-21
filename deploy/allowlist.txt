@@ -1,0 +1,6 @@
+# allowlist.txt -- domains that are never blocked, even if a blocklist lists them.
+# One domain per line. Allowing a domain also allows all of its subdomains.
+# Use it to fix sites that break because a blocklist was too aggressive.
+#
+# Example (remove the leading '#' to activate):
+# ad.doubleclick.net

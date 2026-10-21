@@ -13,7 +13,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/dnsfilter /etc/dnsfilter/blocklist.txt
+ExecStart=/usr/local/bin/dnsfilter /etc/dnsfilter/blocklist.txt /etc/dnsfilter/allowlist.txt
 Restart=on-failure
 RestartSec=2
 
