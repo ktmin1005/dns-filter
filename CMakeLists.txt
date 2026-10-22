@@ -38,6 +38,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 endif()
 
 find_package(Threads REQUIRED)
+find_package(OpenSSL 3.0 REQUIRED)   # DNS over TLS
+
+# Standalone DNS-over-TLS check: ./build/dot_probe
+add_executable(dot_probe tools/dot_probe.cpp src/dot_client.cpp)
+target_include_directories(dot_probe PRIVATE src)
+target_link_libraries(dot_probe PRIVATE OpenSSL::SSL)
+
 add_executable(dnsfilter
   src/main.cpp
   src/blocklist.cpp
