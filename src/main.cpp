@@ -1,4 +1,5 @@
 // main.cpp -- multithreaded DNS filtering server (deployed as a systemd service).
+// Allowed queries are forwarded upstream over DNS over TLS (RFC 7858).
 //
 // One receiver thread reads queries from the client socket and places them
 // on a bounded queue. A fixed pool of worker threads takes queries off the
@@ -13,10 +14,9 @@
 //   - Client socket: sendto() on one UDP socket from several threads is safe;
 //     each call sends one complete datagram.
 //   - Stats: std::atomic counters.
-//   - Upstream sockets: each query gets a brand-new socket (fresh random
-//     source port) and a fresh random query ID, so replies can never reach
-//     the wrong worker and off-path spoofing must guess both. See
-//     forward_upstream().
+//   - Upstream: each worker owns its own DotConnection (a persistent TLS
+//     connection to the resolver), so replies can never reach the wrong
+//     worker. The shared DotContext (TLS settings) is read-only after setup.
 //   - Stop flag: a lock-free std::atomic<bool>, safe to set from a signal
 //     handler and read from another thread.
 
@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>        // memcpy, memset, memcmp
+#include <deque>
 #include <functional>     // std::ref, std::cref
 #include <optional>
 #include <system_error>
@@ -46,6 +47,7 @@
 
 #include "access_control.hpp"
 #include "blocklist.hpp"
+#include "dot_client.hpp"
 #include "dns_parser.hpp"
 #include "work_queue.hpp"
 
@@ -62,9 +64,19 @@ constexpr bool kDebug = false;            // true = hex dumps and parsed fields
 // default; periodic counters are logged instead.
 constexpr bool kLogQueries = false;
 constexpr int kStatsIntervalSec = 300;    // log counters every 5 minutes
-constexpr const char* kUpstreamIp = "1.1.1.1";
-constexpr int kUpstreamTimeoutSec = 2;
-constexpr int kMaxReplyReads = 4;         // bound on stale/bogus replies skipped
+// Upstream resolver, reached only over DNS over TLS on port 853. Its
+// certificate must be valid for kUpstreamTlsName or the connection is refused.
+// There is deliberately NO fallback to plain DNS: if an attacker could block
+// port 853 and make us "fall back", they'd get back everything TLS protects.
+// Two addresses for the same provider, tried in order. If the first fails,
+// the query is retried on the second, and the failed one is skipped for
+// kUpstreamCooldownSec so that every query doesn't wait out its timeout.
+// Both present certificates for kUpstreamTlsName. Each address must also be
+// listed in IPAddressAllow= in deploy/dnsfilter.service.
+constexpr const char* kUpstreamIps[] = {"1.1.1.1", "1.0.0.1"};
+constexpr const char* kUpstreamTlsName = "cloudflare-dns.com";
+constexpr int kUpstreamCooldownSec = 30;
+constexpr int kUpstreamTimeoutSec = 3;    // per connect / handshake / read
 constexpr unsigned kWorkers = 4;          // one per Pi 400 core; tune by benchmark
 constexpr std::size_t kQueueCapacity = 256;   // max queued queries (~1 MB worst case)
 
@@ -146,6 +158,8 @@ struct Stats {
     std::atomic<uint64_t> blocked{0};
     std::atomic<uint64_t> forwarded{0};
     std::atomic<uint64_t> servfail{0};
+    std::atomic<uint64_t> truncated{0};   // reply too big for the client's UDP limit
+    std::atomic<uint64_t> failover{0};    // answered by a backup upstream
 };
 
 // Sends a reply containing the header and question with the given RCODE and,
@@ -199,6 +213,24 @@ void send_header_only(int fd, const uint8_t* query, uint16_t rcode,
     }
 }
 
+// Tells the client the answer is too large for UDP: header + question with
+// the TC (truncated) bit set and no records. A standard client then retries
+// the query over TCP. q.question_end is bounded as for send_error().
+void send_truncated(int fd, const uint8_t* query, const DnsQuery& q,
+                    const sockaddr_in& client, socklen_t client_len) {
+    uint8_t resp[4096];
+    std::memcpy(resp, query, q.question_end);
+    // QR=1, TC=1, copy RD, RA=1, RCODE=0.
+    uint16_t f = 0x8000 | 0x0200 | (q.flags & 0x0100) | 0x0080;
+    resp[2] = static_cast<uint8_t>(f >> 8);
+    resp[3] = static_cast<uint8_t>(f & 0xFF);
+    std::memset(&resp[6], 0, 6);            // ANCOUNT, NSCOUNT, ARCOUNT = 0
+    if (sendto(fd, resp, q.question_end, 0,
+               reinterpret_cast<const sockaddr*>(&client), client_len) < 0) {
+        std::perror("sendto (truncated reply)");
+    }
+}
+
 void hex_dump(const uint8_t* data, std::size_t len) {
     for (std::size_t i = 0; i < len; ++i) {
         if (i % 16 == 0) std::printf("%04zx:  ", i);
@@ -208,43 +240,40 @@ void hex_dump(const uint8_t* data, std::size_t len) {
     std::printf("\n");
 }
 
-// Closes a file descriptor when it goes out of scope, on every return path.
-struct FdGuard {
-    int fd;
-    explicit FdGuard(int f) : fd(f) {}
-    ~FdGuard() { if (fd >= 0) close(fd); }
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
+// One upstream resolver as seen by one worker: its TLS connection, plus the
+// time until which it's skipped after a failure.
+struct Upstream {
+    const char* ip;
+    DotConnection conn;
+    std::chrono::steady_clock::time_point skip_until{};
+
+    Upstream(const DotContext& tls, const char* addr)
+        : ip(addr), conn(tls, addr, kUpstreamTlsName, kUpstreamTimeoutSec) {}
 };
 
-// Creates a UDP socket connected to the upstream resolver, with a receive
-// timeout. Returns -1 (after printing why) on any failure.
-int make_upstream_socket() {
-    int up = socket(AF_INET, SOCK_DGRAM, 0);
-    if (up < 0) { std::perror("upstream socket"); return -1; }
+// True if `reply` (length m) is a genuine answer to `out`, the query we sent:
+// long enough, our random ID, QR=1, and the exact same question.
+bool reply_matches(const uint8_t* reply, ssize_t m, const std::vector<uint8_t>& out,
+                   const DnsQuery& q) {
+    return m >= 0
+        && static_cast<std::size_t>(m) >= q.question_end           // checked first
+        && reply[0] == out[0] && reply[1] == out[1]                // our random ID
+        && (reply[2] & 0x80)                                       // QR=1
+        && std::memcmp(reply + 12, out.data() + 12, q.question_end - 12) == 0;
+}
 
-    timeval tv{};
-    tv.tv_sec = kUpstreamTimeoutSec;
-    if (setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0) {
-        std::perror("setsockopt (upstream timeout)"); close(up); return -1;
-    }
-
-    sockaddr_in upstream{};
-    upstream.sin_family = AF_INET;
-    upstream.sin_port = htons(53);
-    if (inet_pton(AF_INET, kUpstreamIp, &upstream.sin_addr) != 1) {
-        std::fprintf(stderr, "Invalid upstream address: %s\n", kUpstreamIp);
-        close(up); return -1;
-    }
-    // Connected UDP socket: the kernel drops any packet not from upstream:53.
-    if (connect(up, reinterpret_cast<sockaddr*>(&upstream), sizeof upstream) < 0) {
-        std::perror("connect upstream"); close(up); return -1;
-    }
-    return up;
+// Logs a failed lookup. The domain name is included only when per-query
+// logging is on: failure lines are otherwise a record of what someone looked up.
+void log_servfail(const char* what, const DnsQuery& q) {
+    if (kLogQueries) std::printf("%s for %s -> SERVFAIL\n", what, q.name.c_str());
+    else             std::printf("%s -> SERVFAIL\n", what);
 }
 
 // Handles one query from start to finish. Runs on a worker thread.
-void handle_job(const Job& job, int client_fd,
+// `reply`/`reply_cap` is the worker's own buffer, large enough for any DNS
+// message (65,535 bytes, the protocol maximum over TCP/TLS).
+void handle_job(const Job& job, int client_fd, std::deque<Upstream>& upstreams,
+                uint8_t* reply, std::size_t reply_cap,
                 const Blocklist& blocklist, Stats& stats) {
     const uint8_t* buf = job.packet.data();
     const std::size_t n = job.packet.size();
@@ -272,6 +301,7 @@ void handle_job(const Job& job, int client_fd,
             case ParseError::UnexpectedRecords:
             case ParseError::MalformedName:
             case ParseError::Truncated:
+            case ParseError::MalformedOpt:
                 rcode = kRcodeFormerr;
                 break;
             case ParseError::TooShort:      // under 12 bytes: no full header to answer
@@ -296,50 +326,63 @@ void handle_job(const Job& job, int client_fd,
         return;
     }
 
-    // ---- Allowed: forward upstream and relay the reply ----------------------
-    // Spoofing defense (the Kaminsky attack): an off-path attacker forging a
-    // reply from 1.1.1.1 must guess the query ID AND our source port. So each
-    // query gets a fresh socket -- a new random port from the kernel -- and a
-    // fresh random ID from the OS's secure random generator, instead of
-    // trusting whatever ID the client chose.
-    FdGuard up(make_upstream_socket());
+    // ---- Allowed: forward over DNS over TLS and relay the reply -------------
+    // The query keeps a fresh random ID (from the OS's secure generator)
+    // rather than the client's, so even a client with weak IDs can't make
+    // replies predictable. TLS already authenticates the resolver; the ID and
+    // question checks below are defense in depth.
     uint16_t upstream_id = 0;
-    if (up.fd < 0 || getrandom(&upstream_id, sizeof upstream_id, 0) != sizeof upstream_id) {
+    if (getrandom(&upstream_id, sizeof upstream_id, 0) != sizeof upstream_id) {
         ++stats.servfail;
-        std::printf("Upstream setup failed for %s -> SERVFAIL\n", q.name.c_str());
+        log_servfail("Random ID failed", q);
         send_error(client_fd, buf, q, kRcodeServfail, false, job.client, job.client_len);
         return;
     }
-
     std::vector<uint8_t> out(buf, buf + n);              // forwarded copy
     out[0] = static_cast<uint8_t>(upstream_id >> 8);
     out[1] = static_cast<uint8_t>(upstream_id & 0xFF);
-    if (send(up.fd, out.data(), out.size(), 0) != static_cast<ssize_t>(out.size())) {
-        ++stats.servfail;
-        std::printf("Upstream send failed for %s -> SERVFAIL\n", q.name.c_str());
-        send_error(client_fd, buf, q, kRcodeServfail, false, job.client, job.client_len);
-        return;
-    }
 
-    uint8_t reply[4096];
+    // Try each upstream in order, skipping any that failed recently. If every
+    // one is cooling down, try them all anyway rather than fail without trying.
     ssize_t m = -1;
-    for (int attempt = 0; attempt < kMaxReplyReads; ++attempt) {
-        ssize_t r = recv(up.fd, reply, sizeof reply, 0);
-        if (r < 0) break;                                       // timeout or error
-        bool match = static_cast<std::size_t>(r) >= q.question_end     // checked first
-                  && reply[0] == out[0] && reply[1] == out[1]         // our random ID
-                  && (reply[2] & 0x80)                                // QR=1
-                  && std::memcmp(reply + 12, buf + 12, q.question_end - 12) == 0;
-        if (match) { m = r; break; }                            // stale/bogus: keep waiting
+    bool valid = false;
+    const auto now = std::chrono::steady_clock::now();
+    for (int pass = 0; pass < 2 && !valid; ++pass) {
+        bool attempted = false;
+        for (std::size_t i = 0; i < upstreams.size() && !valid; ++i) {
+            Upstream& up = upstreams[i];
+            if (pass == 0 && now < up.skip_until) continue;   // recently failed
+            attempted = true;
+            m = up.conn.exchange(out.data(), out.size(), reply, reply_cap);
+            valid = reply_matches(reply, m, out, q);
+            if (valid) {
+                up.skip_until = {};
+                if (i > 0) ++stats.failover;
+            } else {
+                up.skip_until = now + std::chrono::seconds(kUpstreamCooldownSec);
+                std::printf("Upstream %s failed; skipping it for %d s\n", up.ip,
+                            kUpstreamCooldownSec);
+            }
+        }
+        if (attempted) break;            // pass 0 tried something: don't retry all
     }
-    if (m < 0) {
+    if (!valid) {
         ++stats.servfail;
-        std::printf("Upstream failed for %s -> SERVFAIL\n", q.name.c_str());
+        log_servfail("Upstream failed", q);
         send_error(client_fd, buf, q, kRcodeServfail, false, job.client, job.client_len);
         return;
     }
     reply[0] = buf[0];                                          // restore the
     reply[1] = buf[1];                                          // client's own ID
+
+    // Over TLS the resolver sends the full answer whatever its size, but this
+    // client only accepts q.udp_limit bytes over UDP. Bigger answers get the
+    // standard "truncated" reply so the client knows to retry over TCP.
+    if (static_cast<std::size_t>(m) > q.udp_limit) {
+        ++stats.truncated;
+        send_truncated(client_fd, buf, q, job.client, job.client_len);
+        return;
+    }
     if (sendto(client_fd, reply, static_cast<std::size_t>(m), 0,
                reinterpret_cast<const sockaddr*>(&job.client), job.client_len) < 0) {
         std::perror("sendto (forwarded reply)");
@@ -350,16 +393,24 @@ void handle_job(const Job& job, int client_fd,
 }
 
 // A worker thread: take jobs until the queue is closed and empty.
-void worker_loop(WorkQueue<Job>& queue, int client_fd,
+void worker_loop(WorkQueue<Job>& queue, int client_fd, const DotContext& tls,
                  const Blocklist& blocklist, Stats& stats) {
+    // Each worker's own TLS connection, opened on first use and kept open,
+    // and its own reply buffer sized for the largest possible DNS message.
+    // A deque, not a vector: Upstream can't be moved or copied (it owns a live
+    // TLS connection), and deque::emplace_back never relocates existing items.
+    std::deque<Upstream> upstreams;
+    for (const char* ip : kUpstreamIps) upstreams.emplace_back(tls, ip);
+    std::vector<uint8_t> reply(65535);
     while (std::optional<Job> job = queue.pop()) {
-        handle_job(*job, client_fd, blocklist, stats);
+        handle_job(*job, client_fd, upstreams, reply.data(), reply.size(), blocklist, stats);
     }
 }
 
 void print_stats(const Stats& stats) {
     std::printf("Stats: received=%llu denied=%llu rate_limited=%llu dropped=%llu "
-                "rejected=%llu blocked=%llu forwarded=%llu servfail=%llu\n",
+                "rejected=%llu blocked=%llu forwarded=%llu servfail=%llu truncated=%llu "
+                "failover=%llu\n",
                 static_cast<unsigned long long>(stats.received.load()),
                 static_cast<unsigned long long>(stats.denied.load()),
                 static_cast<unsigned long long>(stats.rate_limited.load()),
@@ -367,7 +418,9 @@ void print_stats(const Stats& stats) {
                 static_cast<unsigned long long>(stats.rejected.load()),
                 static_cast<unsigned long long>(stats.blocked.load()),
                 static_cast<unsigned long long>(stats.forwarded.load()),
-                static_cast<unsigned long long>(stats.servfail.load()));
+                static_cast<unsigned long long>(stats.servfail.load()),
+                static_cast<unsigned long long>(stats.truncated.load()),
+                static_cast<unsigned long long>(stats.failover.load()));
 }
 
 }  // namespace
@@ -452,11 +505,20 @@ int main(int argc, char* argv[]) {
         std::perror("setsockopt (client timeout)"); close(client_fd); return 1;
     }
 
-    // ---- Check the upstream address once, so a typo fails at startup -------
-    {
-        int probe = make_upstream_socket();
-        if (probe < 0) { close(client_fd); return 1; }
-        close(probe);
+    // ---- TLS setup ------------------------------------------------------------
+    // Writing to a TLS connection the resolver already closed raises SIGPIPE,
+    // whose default action kills the whole process. Ignore it; the failed
+    // write is reported as an error and the connection is reopened instead.
+    struct sigaction ignore_pipe{};
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_pipe.sa_mask);
+    if (sigaction(SIGPIPE, &ignore_pipe, nullptr) < 0) {
+        std::perror("sigaction (SIGPIPE)"); close(client_fd); return 1;
+    }
+    DotContext tls;
+    if (!tls.ok()) {
+        std::fprintf(stderr, "Could not set up TLS (DNS over TLS)\n");
+        close(client_fd); return 1;
     }
 
     // ---- Start workers -----------------------------------------------------------
@@ -478,7 +540,7 @@ int main(int argc, char* argv[]) {
     bool started = true;
     try {
         for (unsigned i = 0; i < kWorkers; ++i) {
-            workers.emplace_back(worker_loop, std::ref(queue), client_fd,
+            workers.emplace_back(worker_loop, std::ref(queue), client_fd, std::cref(tls),
                                  std::cref(blocklist), std::ref(stats));
         }
     } catch (const std::system_error& e) {
@@ -496,8 +558,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::printf("Listening on %s:%u with %u workers, forwarding to %s\n",
-                kBindIp, kPort, kWorkers, kUpstreamIp);
+    std::printf("Listening on %s:%u with %u workers, forwarding over TLS to %s, then %s (%s)\n",
+                kBindIp, kPort, kWorkers, kUpstreamIps[0], kUpstreamIps[1], kUpstreamTlsName);
 
     // ---- Receiver loop (this thread) -------------------------------------------
     uint8_t buf[4096];

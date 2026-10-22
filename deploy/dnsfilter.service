@@ -30,7 +30,7 @@ NoNewPrivileges=yes
 # Enforced by the kernel (eBPF), independent of the program's own checks.
 RestrictAddressFamilies=AF_INET
 IPAddressDeny=any
-IPAddressAllow=10.0.0.0/24 1.1.1.1
+IPAddressAllow=10.0.0.0/24 1.1.1.1 1.0.0.1
 
 # ---- Filesystem: everything read-only or invisible ----------------------------
 ProtectSystem=strict
