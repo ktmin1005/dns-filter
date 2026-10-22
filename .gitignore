@@ -71,3 +71,4 @@ lists/
 *.save
 *.save.*
 build-release/
+fuzz/corpus/
