@@ -84,8 +84,10 @@ constexpr double kRatePerSec = 1000.0 / 60.0;
 constexpr double kBurst = 1000.0;
 constexpr std::size_t kMaxTrackedClients = 1024;
 
+constexpr uint16_t kRcodeFormerr = 1;      // format error: the query was malformed
 constexpr uint16_t kRcodeServfail = 2;
 constexpr uint16_t kRcodeNxdomain = 3;
+constexpr uint16_t kRcodeNotimp = 4;       // not implemented: unsupported opcode
 
 // How long clients may cache a "blocked" answer. Longer means fewer repeat
 // queries for the same tracker; shorter means allowlist changes reach clients
@@ -173,6 +175,30 @@ void send_error(int fd, const uint8_t* query, const DnsQuery& q, uint16_t rcode,
     }
 }
 
+// Answers a malformed query with a bare 12-byte header and the given RCODE,
+// so the client fails immediately instead of waiting for a timeout.
+// - No question is echoed back: the question is the part that failed
+//   validation, so none of it is trusted or repeated.
+// - The reply is 12 bytes, never larger than the query (which had at least
+//   12), so it can't be used to amplify traffic.
+// Callers must guarantee the query is at least 12 bytes long.
+void send_header_only(int fd, const uint8_t* query, uint16_t rcode,
+                      const sockaddr_in& client, socklen_t client_len) {
+    uint8_t resp[12];
+    resp[0] = query[0];                     // echo the ID so the client
+    resp[1] = query[1];                     // can match the reply
+    uint16_t qflags = static_cast<uint16_t>((query[2] << 8) | query[3]);
+    // QR=1, copy the opcode and RD, RA=1, RCODE. AA/TC/AD all 0.
+    uint16_t f = 0x8000 | (qflags & 0x7800) | (qflags & 0x0100) | 0x0080 | rcode;
+    resp[2] = static_cast<uint8_t>(f >> 8);
+    resp[3] = static_cast<uint8_t>(f & 0xFF);
+    std::memset(&resp[4], 0, 8);            // QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT = 0
+    if (sendto(fd, resp, sizeof resp, 0,
+               reinterpret_cast<const sockaddr*>(&client), client_len) < 0) {
+        std::perror("sendto (format error reply)");
+    }
+}
+
 void hex_dump(const uint8_t* data, std::size_t len) {
     for (std::size_t i = 0; i < len; ++i) {
         if (i % 16 == 0) std::printf("%04zx:  ", i);
@@ -237,6 +263,23 @@ void handle_job(const Job& job, int client_fd,
     if (err != ParseError::None) {
         ++stats.rejected;
         std::printf("REJECTED packet from %s: %s\n", ip, parse_error_text(err));
+        uint16_t rcode = 0;                 // 0 = send no reply
+        switch (err) {
+            case ParseError::BadOpcode:
+                rcode = kRcodeNotimp;
+                break;
+            case ParseError::BadQuestionCount:
+            case ParseError::UnexpectedRecords:
+            case ParseError::MalformedName:
+            case ParseError::Truncated:
+                rcode = kRcodeFormerr;
+                break;
+            case ParseError::TooShort:      // under 12 bytes: no full header to answer
+            case ParseError::NotQuery:      // never answer a response: prevents reply loops
+            case ParseError::None:
+                break;
+        }
+        if (rcode != 0) send_header_only(client_fd, buf, rcode, job.client, job.client_len);
         return;
     }
     if (kDebug) {
