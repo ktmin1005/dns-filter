@@ -28,6 +28,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         if (q.question_end > size) std::abort();            // never past the input
         if (q.question_end < 17) std::abort();              // header + root name + type/class
         if (q.name.size() > 253) std::abort();              // name length limit
+        if (q.udp_limit < 512 || q.udp_limit > 1232) std::abort();  // clamped UDP size
         for (char c : q.name) {                             // no control chars, no uppercase
             unsigned char u = static_cast<unsigned char>(c);
             if (u < 0x21 || u > 0x7E) std::abort();

@@ -1,31 +1,37 @@
 // main.cpp -- multithreaded DNS filtering server (deployed as a systemd service).
-// Allowed queries are forwarded upstream over DNS over TLS (RFC 7858).
+// Answers DNS over UDP and TCP; forwards allowed queries upstream over DNS over
+// TLS (RFC 7858).
 //
-// One receiver thread reads queries from the client socket and places them
-// on a bounded queue. A fixed pool of worker threads takes queries off the
-// queue and, for each one: parses and validates it, then either answers
-// NXDOMAIN (blocked) or forwards it upstream and relays the reply.
+// Threads:
+//   - UDP receiver (the main thread): reads datagrams, applies the allow-list
+//     and per-client rate limit, and queues them for the UDP workers.
+//   - UDP workers (kWorkers): validate, block or forward, and reply.
+//   - TCP acceptor: accepts connections, applies the allow-list and a
+//     per-client connection rate limit, and queues them for the TCP workers.
+//   - TCP workers (kTcpWorkers): serve a few queries per connection under
+//     strict time limits, using exactly the same query logic as UDP.
 //
 // Shared state and why it's safe:
-//   - Allow-list and RateLimiter: used only by the receiver thread.
-//   - WorkQueue: protected by its own mutex.
-//   - Blocklist: loaded before any thread starts, then only read (const).
-//     Concurrent reads of an unmodified container are safe.
-//   - Client socket: sendto() on one UDP socket from several threads is safe;
-//     each call sends one complete datagram.
+//   - Allow-list: built before any thread starts, then only read.
+//   - Rate limiters: one per accepting thread (UDP receiver, TCP acceptor),
+//     never shared between threads.
+//   - Work queues: each protected by its own mutex.
+//   - Blocklist: loaded before any thread starts, then only read.
+//   - UDP socket: sendto() from several threads is safe; each call sends one
+//     complete datagram.
 //   - Stats: std::atomic counters.
-//   - Upstream: each worker owns its own DotConnection (a persistent TLS
-//     connection to the resolver), so replies can never reach the wrong
-//     worker. The shared DotContext (TLS settings) is read-only after setup.
+//   - Upstreams: each worker owns its own TLS connections; the shared
+//     DotContext (TLS settings) is read-only after setup.
 //   - Stop flag: a lock-free std::atomic<bool>, safe to set from a signal
-//     handler and read from another thread.
+//     handler and read from other threads.
 
 #include <arpa/inet.h>    // htons, inet_pton, inet_ntop
 #include <netinet/in.h>   // sockaddr_in
+#include <netinet/tcp.h>  // TCP_NODELAY
 #include <pthread.h>      // pthread_sigmask
 #include <signal.h>       // sigset_t, sigaction
 #include <sys/random.h>   // getrandom
-#include <sys/socket.h>   // socket, bind, connect, send, recv, sendto, recvfrom
+#include <sys/socket.h>   // socket, bind, listen, accept4, send, recv, sendto, recvfrom
 #include <sys/time.h>     // timeval
 #include <unistd.h>       // close
 
@@ -53,9 +59,12 @@
 
 namespace {
 
-// Where the server listens. Binding to the Pi's specific LAN address (not
-// 0.0.0.0) means it can't be reached through any other interface, such as a
-// VPN or a second network adapter. Requires a DHCP reservation for this IP.
+using Clock = std::chrono::steady_clock;
+
+// Where the server listens (UDP and TCP). Binding to the Pi's specific LAN
+// address (not 0.0.0.0) means it can't be reached through any other
+// interface, such as a VPN or a second network adapter. Requires a DHCP
+// reservation for this IP.
 constexpr const char* kBindIp = "10.0.0.131";
 constexpr uint16_t kPort = 53;            // standard DNS port
 constexpr bool kDebug = false;            // true = hex dumps and parsed fields
@@ -64,21 +73,35 @@ constexpr bool kDebug = false;            // true = hex dumps and parsed fields
 // default; periodic counters are logged instead.
 constexpr bool kLogQueries = false;
 constexpr int kStatsIntervalSec = 300;    // log counters every 5 minutes
-// Upstream resolver, reached only over DNS over TLS on port 853. Its
+
+// Upstream resolvers, reached only over DNS over TLS on port 853. Their
 // certificate must be valid for kUpstreamTlsName or the connection is refused.
 // There is deliberately NO fallback to plain DNS: if an attacker could block
 // port 853 and make us "fall back", they'd get back everything TLS protects.
-// Two addresses for the same provider, tried in order. If the first fails,
-// the query is retried on the second, and the failed one is skipped for
-// kUpstreamCooldownSec so that every query doesn't wait out its timeout.
-// Both present certificates for kUpstreamTlsName. Each address must also be
-// listed in IPAddressAllow= in deploy/dnsfilter.service.
+// The addresses are tried in order; a failed one is skipped for
+// kUpstreamCooldownSec so every query doesn't wait out its timeout. Each
+// address must also be listed in IPAddressAllow= in deploy/dnsfilter.service.
 constexpr const char* kUpstreamIps[] = {"1.1.1.1", "1.0.0.1"};
 constexpr const char* kUpstreamTlsName = "cloudflare-dns.com";
 constexpr int kUpstreamCooldownSec = 30;
 constexpr int kUpstreamTimeoutSec = 3;    // per connect / handshake / read
-constexpr unsigned kWorkers = 4;          // one per Pi 400 core; tune by benchmark
-constexpr std::size_t kQueueCapacity = 256;   // max queued queries (~1 MB worst case)
+
+constexpr unsigned kWorkers = 4;          // UDP workers: one per Pi 400 core
+constexpr std::size_t kQueueCapacity = 256;   // max queued UDP queries (~1 MB worst case)
+
+// DNS over TCP. Clients use it mainly to retry an answer that was too big for
+// UDP. A TCP connection costs far more than a datagram, so everything about it
+// is bounded: how many wait, how long each may take, and how many queries it
+// may carry. A client that stalls or trickles bytes is cut off at the deadline.
+constexpr unsigned kTcpWorkers = 2;
+constexpr std::size_t kTcpQueueCapacity = 16;  // accepted connections waiting
+constexpr int kTcpIoTimeoutSec = 3;            // per read or write
+constexpr int kTcpConnectionSec = 10;          // whole-connection deadline
+constexpr int kTcpMaxQueries = 8;              // queries per connection
+constexpr int kTcpBacklog = 16;                // kernel queue of pending handshakes
+// Per-client connection rate: bursts of 20, refilled at one per second.
+constexpr double kTcpConnRatePerSec = 1.0;
+constexpr double kTcpConnBurst = 20.0;
 
 // Only these subnets may use the server. Everything else is dropped silently.
 // This MUST match your home network -- check with: ip -4 addr show
@@ -86,7 +109,7 @@ constexpr std::size_t kQueueCapacity = 256;   // max queued queries (~1 MB worst
 // the Pi's own queries to that address come from 10.0.0.131, which is inside.)
 constexpr const char* kAllowedNets[] = {"10.0.0.0/24"};
 
-// Per-client rate limit: up to 1000 queries per minute (a burst of 1000,
+// Per-client UDP rate limit: up to 1000 queries per minute (a burst of 1000,
 // refilled at 1000/60 per second). Measured on real browsing: a burst limit
 // of 100 throttled normal use -- a busy page plus background apps can issue
 // hundreds of lookups in seconds, and every dropped query triggers a client
@@ -100,6 +123,10 @@ constexpr uint16_t kRcodeFormerr = 1;      // format error: the query was malfor
 constexpr uint16_t kRcodeServfail = 2;
 constexpr uint16_t kRcodeNxdomain = 3;
 constexpr uint16_t kRcodeNotimp = 4;       // not implemented: unsupported opcode
+
+// Every reply buffer holds the largest possible DNS message (the 2-byte
+// length prefix used over TCP/TLS can't express more than this).
+constexpr std::size_t kMaxMessage = 65535;
 
 // How long clients may cache a "blocked" answer. Longer means fewer repeat
 // queries for the same tracker; shorter means allowlist changes reach clients
@@ -133,7 +160,7 @@ static_assert(kBlockedTtl < 256, "TTL is encoded in a single byte above");
 static_assert(sizeof(kBlockedSoa) == 12 + 67, "SOA record length must match RDLENGTH");
 
 // Set by the signal handler on Ctrl+C (SIGINT) or SIGTERM, read by the
-// receiver thread. A lock-free atomic is both async-signal-safe and safe to
+// other threads. A lock-free atomic is both async-signal-safe and safe to
 // share between threads; `volatile sig_atomic_t` is only guaranteed for a
 // handler and code on the SAME thread, so it would be a data race here.
 std::atomic<bool> g_stop{false};
@@ -142,93 +169,112 @@ static_assert(std::atomic<bool>::is_always_lock_free,
 
 extern "C" void handle_stop_signal(int) { g_stop.store(true); }
 
-// One received packet waiting to be handled.
+// One received UDP datagram waiting to be handled.
 struct Job {
     std::vector<uint8_t> packet;   // exactly the bytes received
     sockaddr_in client{};
     socklen_t client_len = 0;
 };
 
+// One accepted TCP connection waiting to be served. The queue owns the
+// descriptor until a TCP worker takes it.
+struct TcpConn {
+    int fd = -1;
+    char ip[INET_ADDRSTRLEN] = "?";
+};
+
 struct Stats {
-    std::atomic<uint64_t> received{0};
-    std::atomic<uint64_t> denied{0};      // source not in an allowed subnet
-    std::atomic<uint64_t> rate_limited{0};
-    std::atomic<uint64_t> dropped{0};     // queue full
-    std::atomic<uint64_t> rejected{0};    // failed validation
+    std::atomic<uint64_t> received{0};      // UDP datagrams + TCP queries
+    std::atomic<uint64_t> denied{0};        // source not in an allowed subnet
+    std::atomic<uint64_t> rate_limited{0};  // UDP queries or TCP connections over the limit
+    std::atomic<uint64_t> dropped{0};       // UDP queue full
+    std::atomic<uint64_t> rejected{0};      // failed validation
     std::atomic<uint64_t> blocked{0};
     std::atomic<uint64_t> forwarded{0};
     std::atomic<uint64_t> servfail{0};
-    std::atomic<uint64_t> truncated{0};   // reply too big for the client's UDP limit
-    std::atomic<uint64_t> failover{0};    // answered by a backup upstream
+    std::atomic<uint64_t> truncated{0};     // UDP reply too big for the client's limit
+    std::atomic<uint64_t> failover{0};      // answered by a backup upstream
+    std::atomic<uint64_t> tcp_accepted{0};  // TCP connections served
+    std::atomic<uint64_t> tcp_refused{0};   // TCP connections closed unserved (queue full, setup error)
 };
 
-// Sends a reply containing the header and question with the given RCODE and,
-// for blocked names, the synthetic SOA record so clients can cache the block.
-// parse_query() guarantees q.question_end <= the packet length <= 4096, and
-// limits names to 253 characters, so question_end is at most a few hundred
-// bytes; the explicit size check below enforces the bound anyway.
-void send_error(int fd, const uint8_t* query, const DnsQuery& q, uint16_t rcode,
-                bool with_soa, const sockaddr_in& client, socklen_t client_len) {
-    uint8_t resp[4096];
-    std::memcpy(resp, query, q.question_end);
-    // QR=1, copy RD, RA=1, RCODE. Opcode 0, AA/TC/AD all 0.
-    uint16_t f = 0x8000 | (q.flags & 0x0100) | 0x0080 | rcode;
-    resp[2] = static_cast<uint8_t>(f >> 8);
-    resp[3] = static_cast<uint8_t>(f & 0xFF);
-    std::memset(&resp[6], 0, 6);            // ANCOUNT, NSCOUNT, ARCOUNT = 0
+// Closes a file descriptor when it goes out of scope, on every return path.
+struct FdGuard {
+    int fd;
+    explicit FdGuard(int f) : fd(f) {}
+    ~FdGuard() { if (fd >= 0) close(fd); }
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+};
 
-    std::size_t len = q.question_end;
-    if (with_soa && len + sizeof kBlockedSoa <= sizeof resp) {
-        std::memcpy(resp + len, kBlockedSoa, sizeof kBlockedSoa);
-        len += sizeof kBlockedSoa;
-        resp[9] = 1;                        // NSCOUNT = 1 (low byte; high byte is 0)
-    }
-    if (sendto(fd, resp, len, 0,
-               reinterpret_cast<const sockaddr*>(&client), client_len) < 0) {
-        std::perror("sendto (error reply)");
-    }
+// Formats an IPv4 address for log lines ("?" if that somehow fails).
+void format_ip(const in_addr& a, char (&out)[INET_ADDRSTRLEN]) {
+    if (inet_ntop(AF_INET, &a, out, sizeof out) == nullptr) std::memcpy(out, "?", 2);
 }
 
-// Answers a malformed query with a bare 12-byte header and the given RCODE,
-// so the client fails immediately instead of waiting for a timeout.
+bool is_allowed(const std::vector<Ipv4Net>& allowed, uint32_t addr) {
+    for (const Ipv4Net& net : allowed) {
+        if (net_contains(net, addr)) return true;
+    }
+    return false;
+}
+
+// ---- Reply builders --------------------------------------------------------
+// Each writes a complete reply into `out` (capacity `cap`, always >= 4096 here)
+// and returns its length, or 0 if it doesn't fit. parse_query() guarantees
+// q.question_end <= the query length <= 4096.
+
+// Header and question with the given RCODE; for blocked names, also the
+// synthetic SOA record so clients can cache the block.
+std::size_t build_error(uint8_t* out, std::size_t cap, const uint8_t* query,
+                        const DnsQuery& q, uint16_t rcode, bool with_soa) {
+    if (q.question_end > cap) return 0;
+    std::memcpy(out, query, q.question_end);
+    // QR=1, copy RD, RA=1, RCODE. Opcode 0, AA/TC/AD all 0.
+    uint16_t f = 0x8000 | (q.flags & 0x0100) | 0x0080 | rcode;
+    out[2] = static_cast<uint8_t>(f >> 8);
+    out[3] = static_cast<uint8_t>(f & 0xFF);
+    std::memset(&out[6], 0, 6);             // ANCOUNT, NSCOUNT, ARCOUNT = 0
+
+    std::size_t len = q.question_end;
+    if (with_soa && len + sizeof kBlockedSoa <= cap) {
+        std::memcpy(out + len, kBlockedSoa, sizeof kBlockedSoa);
+        len += sizeof kBlockedSoa;
+        out[9] = 1;                         // NSCOUNT = 1 (low byte; high byte is 0)
+    }
+    return len;
+}
+
+// A bare 12-byte header with the given RCODE, for malformed queries.
 // - No question is echoed back: the question is the part that failed
 //   validation, so none of it is trusted or repeated.
-// - The reply is 12 bytes, never larger than the query (which had at least
-//   12), so it can't be used to amplify traffic.
+// - The reply is never larger than the query (which had at least 12 bytes),
+//   so it can't be used to amplify traffic.
 // Callers must guarantee the query is at least 12 bytes long.
-void send_header_only(int fd, const uint8_t* query, uint16_t rcode,
-                      const sockaddr_in& client, socklen_t client_len) {
-    uint8_t resp[12];
-    resp[0] = query[0];                     // echo the ID so the client
-    resp[1] = query[1];                     // can match the reply
+std::size_t build_header_only(uint8_t* out, const uint8_t* query, uint16_t rcode) {
+    out[0] = query[0];                      // echo the ID so the client
+    out[1] = query[1];                      // can match the reply
     uint16_t qflags = static_cast<uint16_t>((query[2] << 8) | query[3]);
     // QR=1, copy the opcode and RD, RA=1, RCODE. AA/TC/AD all 0.
     uint16_t f = 0x8000 | (qflags & 0x7800) | (qflags & 0x0100) | 0x0080 | rcode;
-    resp[2] = static_cast<uint8_t>(f >> 8);
-    resp[3] = static_cast<uint8_t>(f & 0xFF);
-    std::memset(&resp[4], 0, 8);            // QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT = 0
-    if (sendto(fd, resp, sizeof resp, 0,
-               reinterpret_cast<const sockaddr*>(&client), client_len) < 0) {
-        std::perror("sendto (format error reply)");
-    }
+    out[2] = static_cast<uint8_t>(f >> 8);
+    out[3] = static_cast<uint8_t>(f & 0xFF);
+    std::memset(&out[4], 0, 8);             // QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT = 0
+    return 12;
 }
 
-// Tells the client the answer is too large for UDP: header + question with
-// the TC (truncated) bit set and no records. A standard client then retries
-// the query over TCP. q.question_end is bounded as for send_error().
-void send_truncated(int fd, const uint8_t* query, const DnsQuery& q,
-                    const sockaddr_in& client, socklen_t client_len) {
-    uint8_t resp[4096];
-    std::memcpy(resp, query, q.question_end);
+// Header and question with TC (truncated) set and no records: "too big for
+// UDP, ask again over TCP".
+std::size_t build_truncated(uint8_t* out, std::size_t cap, const uint8_t* query,
+                            const DnsQuery& q) {
+    if (q.question_end > cap) return 0;
+    std::memcpy(out, query, q.question_end);
     // QR=1, TC=1, copy RD, RA=1, RCODE=0.
     uint16_t f = 0x8000 | 0x0200 | (q.flags & 0x0100) | 0x0080;
-    resp[2] = static_cast<uint8_t>(f >> 8);
-    resp[3] = static_cast<uint8_t>(f & 0xFF);
-    std::memset(&resp[6], 0, 6);            // ANCOUNT, NSCOUNT, ARCOUNT = 0
-    if (sendto(fd, resp, q.question_end, 0,
-               reinterpret_cast<const sockaddr*>(&client), client_len) < 0) {
-        std::perror("sendto (truncated reply)");
-    }
+    out[2] = static_cast<uint8_t>(f >> 8);
+    out[3] = static_cast<uint8_t>(f & 0xFF);
+    std::memset(&out[6], 0, 6);             // ANCOUNT, NSCOUNT, ARCOUNT = 0
+    return q.question_end;
 }
 
 void hex_dump(const uint8_t* data, std::size_t len) {
@@ -245,11 +291,20 @@ void hex_dump(const uint8_t* data, std::size_t len) {
 struct Upstream {
     const char* ip;
     DotConnection conn;
-    std::chrono::steady_clock::time_point skip_until{};
+    Clock::time_point skip_until{};
 
     Upstream(const DotContext& tls, const char* addr)
         : ip(addr), conn(tls, addr, kUpstreamTlsName, kUpstreamTimeoutSec) {}
 };
+
+// A worker's upstream set. A deque, not a vector: Upstream can't be moved or
+// copied (it owns a live TLS connection), and deque::emplace_back never
+// relocates existing items.
+std::deque<Upstream> make_upstreams(const DotContext& tls) {
+    std::deque<Upstream> ups;
+    for (const char* ip : kUpstreamIps) ups.emplace_back(tls, ip);
+    return ups;
+}
 
 // True if `reply` (length m) is a genuine answer to `out`, the query we sent:
 // long enough, our random ID, QR=1, and the exact same question.
@@ -269,21 +324,19 @@ void log_servfail(const char* what, const DnsQuery& q) {
     else             std::printf("%s -> SERVFAIL\n", what);
 }
 
-// Handles one query from start to finish. Runs on a worker thread.
-// `reply`/`reply_cap` is the worker's own buffer, large enough for any DNS
-// message (65,535 bytes, the protocol maximum over TCP/TLS).
-void handle_job(const Job& job, int client_fd, std::deque<Upstream>& upstreams,
-                uint8_t* reply, std::size_t reply_cap,
-                const Blocklist& blocklist, Stats& stats) {
-    const uint8_t* buf = job.packet.data();
-    const std::size_t n = job.packet.size();
+enum class Transport { Udp, Tcp };
 
-    char ip[INET_ADDRSTRLEN] = "?";
-    if (inet_ntop(AF_INET, &job.client.sin_addr, ip, sizeof ip) == nullptr) {
-        std::strcpy(ip, "?");
-    }
+// Handles one query from start to finish, for either transport, and writes
+// the reply into `reply` (capacity reply_cap >= 4096). Returns the reply's
+// length, or 0 when no reply should be sent.
+std::size_t process_query(const uint8_t* buf, std::size_t n, const char* ip,
+                          Transport transport, std::deque<Upstream>& upstreams,
+                          uint8_t* reply, std::size_t reply_cap,
+                          const Blocklist& blocklist, Stats& stats) {
+    if (reply_cap < 4096) return 0;
     if (kDebug) {
-        std::printf("Received %zu bytes from %s:%u\n", n, ip, ntohs(job.client.sin_port));
+        std::printf("Received %zu bytes from %s over %s\n", n, ip,
+                    transport == Transport::Udp ? "UDP" : "TCP");
         hex_dump(buf, n);
     }
 
@@ -292,25 +345,21 @@ void handle_job(const Job& job, int client_fd, std::deque<Upstream>& upstreams,
     if (err != ParseError::None) {
         ++stats.rejected;
         std::printf("REJECTED packet from %s: %s\n", ip, parse_error_text(err));
-        uint16_t rcode = 0;                 // 0 = send no reply
         switch (err) {
             case ParseError::BadOpcode:
-                rcode = kRcodeNotimp;
-                break;
+                return build_header_only(reply, buf, kRcodeNotimp);
             case ParseError::BadQuestionCount:
             case ParseError::UnexpectedRecords:
             case ParseError::MalformedName:
             case ParseError::Truncated:
             case ParseError::MalformedOpt:
-                rcode = kRcodeFormerr;
-                break;
+                return build_header_only(reply, buf, kRcodeFormerr);
             case ParseError::TooShort:      // under 12 bytes: no full header to answer
             case ParseError::NotQuery:      // never answer a response: prevents reply loops
             case ParseError::None:
-                break;
+                return 0;
         }
-        if (rcode != 0) send_header_only(client_fd, buf, rcode, job.client, job.client_len);
-        return;
+        return 0;
     }
     if (kDebug) {
         std::printf("ID=%u RD=%d Name=%s QTYPE=%u\n", static_cast<unsigned>(q.id),
@@ -320,23 +369,21 @@ void handle_job(const Job& job, int client_fd, std::deque<Upstream>& upstreams,
 
     // ---- Blocked: answer NXDOMAIN ourselves ---------------------------------
     if (blocklist.is_blocked(q.name)) {
-        send_error(client_fd, buf, q, kRcodeNxdomain, true, job.client, job.client_len);
         ++stats.blocked;
         if (kLogQueries) std::printf("BLOCKED %s\n", q.name.c_str());
-        return;
+        return build_error(reply, reply_cap, buf, q, kRcodeNxdomain, true);
     }
 
-    // ---- Allowed: forward over DNS over TLS and relay the reply -------------
-    // The query keeps a fresh random ID (from the OS's secure generator)
+    // ---- Allowed: forward over DNS over TLS --------------------------------
+    // The query carries a fresh random ID (from the OS's secure generator)
     // rather than the client's, so even a client with weak IDs can't make
     // replies predictable. TLS already authenticates the resolver; the ID and
-    // question checks below are defense in depth.
+    // question checks are defense in depth.
     uint16_t upstream_id = 0;
     if (getrandom(&upstream_id, sizeof upstream_id, 0) != sizeof upstream_id) {
         ++stats.servfail;
         log_servfail("Random ID failed", q);
-        send_error(client_fd, buf, q, kRcodeServfail, false, job.client, job.client_len);
-        return;
+        return build_error(reply, reply_cap, buf, q, kRcodeServfail, false);
     }
     std::vector<uint8_t> out(buf, buf + n);              // forwarded copy
     out[0] = static_cast<uint8_t>(upstream_id >> 8);
@@ -346,7 +393,7 @@ void handle_job(const Job& job, int client_fd, std::deque<Upstream>& upstreams,
     // one is cooling down, try them all anyway rather than fail without trying.
     ssize_t m = -1;
     bool valid = false;
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = Clock::now();
     for (int pass = 0; pass < 2 && !valid; ++pass) {
         bool attempted = false;
         for (std::size_t i = 0; i < upstreams.size() && !valid; ++i) {
@@ -369,58 +416,171 @@ void handle_job(const Job& job, int client_fd, std::deque<Upstream>& upstreams,
     if (!valid) {
         ++stats.servfail;
         log_servfail("Upstream failed", q);
-        send_error(client_fd, buf, q, kRcodeServfail, false, job.client, job.client_len);
-        return;
+        return build_error(reply, reply_cap, buf, q, kRcodeServfail, false);
     }
-    reply[0] = buf[0];                                          // restore the
-    reply[1] = buf[1];                                          // client's own ID
+    reply[0] = buf[0];                   // restore the
+    reply[1] = buf[1];                   // client's own ID
 
-    // Over TLS the resolver sends the full answer whatever its size, but this
-    // client only accepts q.udp_limit bytes over UDP. Bigger answers get the
-    // standard "truncated" reply so the client knows to retry over TCP.
-    if (static_cast<std::size_t>(m) > q.udp_limit) {
+    // Over TLS the resolver sends the full answer whatever its size, but a UDP
+    // client only accepts q.udp_limit bytes. Bigger answers get the standard
+    // "truncated" reply; the client then asks again over TCP, where the full
+    // answer is sent.
+    if (transport == Transport::Udp && static_cast<std::size_t>(m) > q.udp_limit) {
         ++stats.truncated;
-        send_truncated(client_fd, buf, q, job.client, job.client_len);
-        return;
-    }
-    if (sendto(client_fd, reply, static_cast<std::size_t>(m), 0,
-               reinterpret_cast<const sockaddr*>(&job.client), job.client_len) < 0) {
-        std::perror("sendto (forwarded reply)");
-        return;
+        return build_truncated(reply, reply_cap, buf, q);
     }
     ++stats.forwarded;
     if (kLogQueries) std::printf("FORWARDED %s\n", q.name.c_str());
+    return static_cast<std::size_t>(m);
 }
 
-// A worker thread: take jobs until the queue is closed and empty.
-void worker_loop(WorkQueue<Job>& queue, int client_fd, const DotContext& tls,
-                 const Blocklist& blocklist, Stats& stats) {
-    // Each worker's own TLS connection, opened on first use and kept open,
-    // and its own reply buffer sized for the largest possible DNS message.
-    // A deque, not a vector: Upstream can't be moved or copied (it owns a live
-    // TLS connection), and deque::emplace_back never relocates existing items.
-    std::deque<Upstream> upstreams;
-    for (const char* ip : kUpstreamIps) upstreams.emplace_back(tls, ip);
-    std::vector<uint8_t> reply(65535);
+// ---- UDP -------------------------------------------------------------------
+
+// A UDP worker thread: take datagrams until the queue is closed and empty.
+void udp_worker(WorkQueue<Job>& queue, int udp_fd, const DotContext& tls,
+                const Blocklist& blocklist, Stats& stats) {
+    std::deque<Upstream> upstreams = make_upstreams(tls);
+    std::vector<uint8_t> reply(kMaxMessage);
     while (std::optional<Job> job = queue.pop()) {
-        handle_job(*job, client_fd, upstreams, reply.data(), reply.size(), blocklist, stats);
+        char ip[INET_ADDRSTRLEN];
+        format_ip(job->client.sin_addr, ip);
+        std::size_t len = process_query(job->packet.data(), job->packet.size(), ip,
+                                        Transport::Udp, upstreams, reply.data(),
+                                        reply.size(), blocklist, stats);
+        if (len > 0 &&
+            sendto(udp_fd, reply.data(), len, 0,
+                   reinterpret_cast<const sockaddr*>(&job->client), job->client_len) < 0) {
+            std::perror("sendto (UDP reply)");
+        }
+    }
+}
+
+// ---- TCP -------------------------------------------------------------------
+
+// Reads exactly `len` bytes. Fails on EOF, error, the per-read timeout
+// (SO_RCVTIMEO), or the connection's overall deadline -- so a client that
+// trickles one byte at a time can't hold a worker past the deadline.
+bool tcp_read_exact(int fd, uint8_t* p, std::size_t len, Clock::time_point deadline) {
+    while (len > 0) {
+        if (Clock::now() >= deadline) return false;
+        ssize_t r = recv(fd, p, len, 0);
+        if (r > 0) { p += r; len -= static_cast<std::size_t>(r); continue; }
+        if (r < 0 && errno == EINTR) continue;
+        return false;                       // 0 = client closed; <0 = timeout or error
+    }
+    return true;
+}
+
+// Writes all `len` bytes under the same limits. MSG_NOSIGNAL: writing to a
+// connection the client already closed returns an error instead of raising
+// SIGPIPE.
+bool tcp_write_all(int fd, const uint8_t* p, std::size_t len, Clock::time_point deadline) {
+    while (len > 0) {
+        if (Clock::now() >= deadline) return false;
+        ssize_t w = send(fd, p, len, MSG_NOSIGNAL);
+        if (w > 0) { p += w; len -= static_cast<std::size_t>(w); continue; }
+        if (w < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+// Serves up to kTcpMaxQueries queries on one connection. Each message is
+// framed by a 2-byte big-endian length (RFC 1035 section 4.2.2). Any framing
+// problem, timeout, or query that gets no reply ends the connection.
+void serve_tcp_connection(const TcpConn& conn, std::deque<Upstream>& upstreams,
+                          std::vector<uint8_t>& frame, const Blocklist& blocklist,
+                          Stats& stats) {
+    const auto deadline = Clock::now() + std::chrono::seconds(kTcpConnectionSec);
+    uint8_t query[4096];                    // same limit as a UDP query
+    for (int i = 0; i < kTcpMaxQueries; ++i) {
+        uint8_t len_bytes[2];
+        if (!tcp_read_exact(conn.fd, len_bytes, 2, deadline)) return;
+        const std::size_t qlen = (static_cast<std::size_t>(len_bytes[0]) << 8) | len_bytes[1];
+        if (qlen == 0 || qlen > sizeof query) return;   // empty or oversize: hang up
+        if (!tcp_read_exact(conn.fd, query, qlen, deadline)) return;
+        ++stats.received;
+
+        // The reply is built 2 bytes into `frame`, leaving room for its length.
+        std::size_t rlen = process_query(query, qlen, conn.ip, Transport::Tcp, upstreams,
+                                         frame.data() + 2, frame.size() - 2,
+                                         blocklist, stats);
+        if (rlen == 0) return;
+        frame[0] = static_cast<uint8_t>(rlen >> 8);
+        frame[1] = static_cast<uint8_t>(rlen & 0xFF);
+        if (!tcp_write_all(conn.fd, frame.data(), rlen + 2, deadline)) return;
+    }
+}
+
+// A TCP worker thread: take connections until the queue is closed and empty.
+void tcp_worker(WorkQueue<TcpConn>& queue, const DotContext& tls,
+                const Blocklist& blocklist, Stats& stats) {
+    std::deque<Upstream> upstreams = make_upstreams(tls);
+    std::vector<uint8_t> frame(2 + kMaxMessage);
+    while (std::optional<TcpConn> conn = queue.pop()) {
+        FdGuard guard(conn->fd);            // closed when this connection is done
+        serve_tcp_connection(*conn, upstreams, frame, blocklist, stats);
+    }
+}
+
+// The TCP acceptor thread. Access control happens before a connection is
+// queued; refused connections are closed immediately and counted, not logged.
+void tcp_acceptor(int listen_fd, const std::vector<Ipv4Net>& allowed,
+                  WorkQueue<TcpConn>& queue, Stats& stats) {
+    RateLimiter limiter(kTcpConnRatePerSec, kTcpConnBurst, kMaxTrackedClients);
+    while (!g_stop.load()) {
+        sockaddr_in peer{};
+        socklen_t peer_len = sizeof peer;
+        int fd = accept4(listen_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len,
+                         SOCK_CLOEXEC);
+        if (fd < 0) {
+            // Timeout (to re-check g_stop), signal, or a client that gave up
+            // during the handshake: not errors.
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ||
+                errno == ECONNABORTED) continue;
+            std::perror("accept");
+            continue;
+        }
+        FdGuard guard(fd);
+
+        if (peer_len != sizeof(sockaddr_in) || peer.sin_family != AF_INET) {
+            ++stats.denied;
+            continue;
+        }
+        const uint32_t src = ntohl(peer.sin_addr.s_addr);
+        if (!is_allowed(allowed, src)) { ++stats.denied; continue; }
+        if (!limiter.allow(src, Clock::now())) { ++stats.rate_limited; continue; }
+
+        timeval tv{};
+        tv.tv_sec = kTcpIoTimeoutSec;
+        int one = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0 ||
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) < 0 ||
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one) < 0) {
+            ++stats.tcp_refused;
+            continue;
+        }
+
+        TcpConn conn;
+        conn.fd = fd;
+        format_ip(peer.sin_addr, conn.ip);
+        if (!queue.try_push(conn)) { ++stats.tcp_refused; continue; }   // guard closes it
+        guard.fd = -1;                      // the queue owns it now
+        ++stats.tcp_accepted;
     }
 }
 
 void print_stats(const Stats& stats) {
+    auto v = [](const std::atomic<uint64_t>& a) {
+        return static_cast<unsigned long long>(a.load());
+    };
     std::printf("Stats: received=%llu denied=%llu rate_limited=%llu dropped=%llu "
                 "rejected=%llu blocked=%llu forwarded=%llu servfail=%llu truncated=%llu "
-                "failover=%llu\n",
-                static_cast<unsigned long long>(stats.received.load()),
-                static_cast<unsigned long long>(stats.denied.load()),
-                static_cast<unsigned long long>(stats.rate_limited.load()),
-                static_cast<unsigned long long>(stats.dropped.load()),
-                static_cast<unsigned long long>(stats.rejected.load()),
-                static_cast<unsigned long long>(stats.blocked.load()),
-                static_cast<unsigned long long>(stats.forwarded.load()),
-                static_cast<unsigned long long>(stats.servfail.load()),
-                static_cast<unsigned long long>(stats.truncated.load()),
-                static_cast<unsigned long long>(stats.failover.load()));
+                "failover=%llu tcp_accepted=%llu tcp_refused=%llu\n",
+                v(stats.received), v(stats.denied), v(stats.rate_limited), v(stats.dropped),
+                v(stats.rejected), v(stats.blocked), v(stats.forwarded), v(stats.servfail),
+                v(stats.truncated), v(stats.failover), v(stats.tcp_accepted),
+                v(stats.tcp_refused));
 }
 
 }  // namespace
@@ -461,13 +621,24 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "Warning: blocklist truncated at entry limit\n");
     }
 
-    // ---- Signals: Ctrl+C / SIGTERM request a clean shutdown ------------------
-    // No SA_RESTART, so a blocked recvfrom() returns early with EINTR.
+    // ---- Signals --------------------------------------------------------------
+    // Ctrl+C / SIGTERM request a clean shutdown. No SA_RESTART, so a blocked
+    // recvfrom() returns early with EINTR.
     struct sigaction sa{};
     sa.sa_handler = handle_stop_signal;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGINT, &sa, nullptr) < 0 || sigaction(SIGTERM, &sa, nullptr) < 0) {
         std::perror("sigaction");
+        return 1;
+    }
+    // Writing to a connection the other side already closed raises SIGPIPE,
+    // whose default action kills the whole process. Ignore it; the failed
+    // write is reported as an error and handled instead.
+    struct sigaction ignore_pipe{};
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_pipe.sa_mask);
+    if (sigaction(SIGPIPE, &ignore_pipe, nullptr) < 0) {
+        std::perror("sigaction (SIGPIPE)");
         return 1;
     }
 
@@ -481,100 +652,113 @@ int main(int argc, char* argv[]) {
         }
         allowed.push_back(n);
     }
-    RateLimiter limiter(kRatePerSec, kBurst, kMaxTrackedClients);
-
-    // ---- Client-facing socket -------------------------------------------------
-    int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (client_fd < 0) { std::perror("socket"); return 1; }
+    RateLimiter limiter(kRatePerSec, kBurst, kMaxTrackedClients);   // UDP receiver only
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(kPort);
     if (inet_pton(AF_INET, kBindIp, &addr.sin_addr) != 1) {
         std::fprintf(stderr, "Invalid bind address: %s\n", kBindIp);
-        close(client_fd); return 1;
+        return 1;
     }
-    if (bind(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
-        std::perror("bind"); close(client_fd); return 1;
+    // A 1-second receive timeout on both listening sockets, so the UDP
+    // receiver and the TCP acceptor re-check g_stop (and the stats timer)
+    // regularly, even when nothing arrives.
+    timeval one_second{};
+    one_second.tv_sec = 1;
+
+    // ---- UDP socket -------------------------------------------------------------
+    int udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (udp_fd < 0) { std::perror("socket (UDP)"); return 1; }
+    FdGuard udp_guard(udp_fd);
+    if (bind(udp_fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
+        std::perror("bind (UDP)"); return 1;
     }
-    // A 1-second receive timeout so the receiver re-checks g_stop and the
-    // stats timer regularly, even when no queries arrive.
-    timeval rtv{};
-    rtv.tv_sec = 1;
-    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv) < 0) {
-        std::perror("setsockopt (client timeout)"); close(client_fd); return 1;
+    if (setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &one_second, sizeof one_second) < 0) {
+        std::perror("setsockopt (UDP timeout)"); return 1;
     }
 
-    // ---- TLS setup ------------------------------------------------------------
-    // Writing to a TLS connection the resolver already closed raises SIGPIPE,
-    // whose default action kills the whole process. Ignore it; the failed
-    // write is reported as an error and the connection is reopened instead.
-    struct sigaction ignore_pipe{};
-    ignore_pipe.sa_handler = SIG_IGN;
-    sigemptyset(&ignore_pipe.sa_mask);
-    if (sigaction(SIGPIPE, &ignore_pipe, nullptr) < 0) {
-        std::perror("sigaction (SIGPIPE)"); close(client_fd); return 1;
+    // ---- TCP listening socket ---------------------------------------------------
+    int tcp_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (tcp_fd < 0) { std::perror("socket (TCP)"); return 1; }
+    FdGuard tcp_guard(tcp_fd);
+    // SO_REUSEADDR lets a restarted server bind while old connections from the
+    // previous run are still in TIME_WAIT. (It does not let another program
+    // share the port; that would be SO_REUSEPORT, which isn't used.)
+    int one = 1;
+    if (setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0 ||
+        bind(tcp_fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0 ||
+        listen(tcp_fd, kTcpBacklog) < 0 ||
+        setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &one_second, sizeof one_second) < 0) {
+        std::perror("TCP listening socket"); return 1;
     }
+
+    // ---- TLS --------------------------------------------------------------------
     DotContext tls;
     if (!tls.ok()) {
         std::fprintf(stderr, "Could not set up TLS (DNS over TLS)\n");
-        close(client_fd); return 1;
+        return 1;
     }
 
-    // ---- Start workers -----------------------------------------------------------
-    WorkQueue<Job> queue(kQueueCapacity);
+    // ---- Start threads ------------------------------------------------------------
+    WorkQueue<Job> udp_queue(kQueueCapacity);
+    WorkQueue<TcpConn> tcp_queue(kTcpQueueCapacity);
     Stats stats;
-    std::vector<std::thread> workers;
+    std::vector<std::thread> udp_workers;
+    std::vector<std::thread> tcp_workers;
+    std::thread acceptor;
 
-    // Block SIGINT/SIGTERM while creating workers: new threads inherit the
-    // mask, so these signals can only be delivered to this (receiver) thread,
-    // where they interrupt recvfrom() and stop the loop immediately.
+    // Block SIGINT/SIGTERM while creating threads: new threads inherit the
+    // mask, so these signals can only be delivered to this (UDP receiver)
+    // thread, where they interrupt recvfrom() and stop the loop immediately.
     sigset_t stop_signals, old_mask;
     sigemptyset(&stop_signals);
     sigaddset(&stop_signals, SIGINT);
     sigaddset(&stop_signals, SIGTERM);
     if (pthread_sigmask(SIG_BLOCK, &stop_signals, &old_mask) != 0) {
         std::fprintf(stderr, "pthread_sigmask failed\n");
-        close(client_fd); return 1;
+        return 1;
     }
     bool started = true;
     try {
         for (unsigned i = 0; i < kWorkers; ++i) {
-            workers.emplace_back(worker_loop, std::ref(queue), client_fd, std::cref(tls),
-                                 std::cref(blocklist), std::ref(stats));
+            udp_workers.emplace_back(udp_worker, std::ref(udp_queue), udp_fd, std::cref(tls),
+                                     std::cref(blocklist), std::ref(stats));
         }
+        for (unsigned i = 0; i < kTcpWorkers; ++i) {
+            tcp_workers.emplace_back(tcp_worker, std::ref(tcp_queue), std::cref(tls),
+                                     std::cref(blocklist), std::ref(stats));
+        }
+        acceptor = std::thread(tcp_acceptor, tcp_fd, std::cref(allowed),
+                               std::ref(tcp_queue), std::ref(stats));
     } catch (const std::system_error& e) {
-        std::fprintf(stderr, "Failed to start worker thread: %s\n", e.what());
+        std::fprintf(stderr, "Failed to start a thread: %s\n", e.what());
         started = false;
     }
     if (pthread_sigmask(SIG_SETMASK, &old_mask, nullptr) != 0) {
         std::fprintf(stderr, "pthread_sigmask restore failed\n");
         started = false;
     }
-    if (!started) {
-        queue.close();
-        for (std::thread& t : workers) t.join();
-        close(client_fd);
-        return 1;
+
+    std::vector<uint8_t> buf(4096);
+    auto next_stats = Clock::now() + std::chrono::seconds(kStatsIntervalSec);
+    if (started) {
+        std::printf("Listening on %s:%u (UDP and TCP), %u+%u workers, forwarding over "
+                    "TLS to %s, then %s (%s)\n",
+                    kBindIp, kPort, kWorkers, kTcpWorkers, kUpstreamIps[0],
+                    kUpstreamIps[1], kUpstreamTlsName);
     }
 
-    std::printf("Listening on %s:%u with %u workers, forwarding over TLS to %s, then %s (%s)\n",
-                kBindIp, kPort, kWorkers, kUpstreamIps[0], kUpstreamIps[1], kUpstreamTlsName);
-
-    // ---- Receiver loop (this thread) -------------------------------------------
-    uint8_t buf[4096];
-    auto next_stats = RateLimiter::Clock::now() + std::chrono::seconds(kStatsIntervalSec);
-    while (!g_stop.load()) {
-        // The 1-second receive timeout guarantees this check runs regularly
-        // even when no queries arrive.
-        if (RateLimiter::Clock::now() >= next_stats) {
+    // ---- UDP receiver loop (this thread) -----------------------------------------
+    while (started && !g_stop.load()) {
+        if (Clock::now() >= next_stats) {
             print_stats(stats);
             next_stats += std::chrono::seconds(kStatsIntervalSec);
         }
 
         Job job;
         job.client_len = sizeof job.client;
-        ssize_t n = recvfrom(client_fd, buf, sizeof buf, 0,
+        ssize_t n = recvfrom(udp_fd, buf.data(), buf.size(), 0,
                              reinterpret_cast<sockaddr*>(&job.client), &job.client_len);
         if (n < 0) {
             // Timeout or signal: not an error, just a chance to check g_stop.
@@ -592,30 +776,26 @@ int main(int argc, char* argv[]) {
             continue;
         }
         const uint32_t src = ntohl(job.client.sin_addr.s_addr);
-        bool permitted = false;
-        for (const Ipv4Net& net : allowed) {
-            if (net_contains(net, src)) { permitted = true; break; }
-        }
-        if (!permitted) { ++stats.denied; continue; }
-        if (!limiter.allow(src, RateLimiter::Clock::now())) {
-            ++stats.rate_limited;
-            continue;
-        }
+        if (!is_allowed(allowed, src)) { ++stats.denied; continue; }
+        if (!limiter.allow(src, Clock::now())) { ++stats.rate_limited; continue; }
 
-        job.packet.assign(buf, buf + n);
-        if (!queue.try_push(std::move(job))) {
+        job.packet.assign(buf.data(), buf.data() + n);
+        if (!udp_queue.try_push(std::move(job))) {
             // Queue full: drop rather than reply, so a flood can't turn this
             // server into a source of extra traffic.
             ++stats.dropped;
         }
     }
 
-    // ---- Clean shutdown ------------------------------------------------------------
-    std::printf("\nShutting down: finishing queued queries...\n");
-    queue.close();                       // workers drain the queue, then exit
-    for (std::thread& t : workers) t.join();
-    close(client_fd);
+    // ---- Clean shutdown (also the cleanup path if startup failed) -----------------
+    if (started) std::printf("\nShutting down: finishing queued queries...\n");
+    g_stop.store(true);                   // the acceptor exits within a second
+    if (acceptor.joinable()) acceptor.join();
+    tcp_queue.close();                    // TCP workers finish their connections, then exit
+    for (std::thread& t : tcp_workers) t.join();
+    udp_queue.close();                    // UDP workers drain the queue, then exit
+    for (std::thread& t : udp_workers) t.join();
 
     print_stats(stats);
-    return 0;
+    return started ? 0 : 1;
 }

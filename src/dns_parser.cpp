@@ -67,8 +67,28 @@ ParseError parse_query(const uint8_t* buf, std::size_t len, DnsQuery& out) {
     // QTYPE and QCLASS: 2 bytes each.
     if (pos + 4 > len) return ParseError::Truncated;
 
+    // EDNS: if the first additional record is an OPT record (type 41), its
+    // CLASS field is the client's maximum UDP reply size. Anything else in the
+    // additional section is left alone (the query is still forwarded intact).
+    std::size_t udp_limit = 512;
+    const std::size_t after_question = pos + 4;
+    if (read_u16(buf + 10) > 0 && after_question + 11 <= len &&
+        buf[after_question] == 0 &&                         // owner name: root
+        read_u16(buf + after_question + 1) == 41) {          // TYPE = OPT
+        const uint16_t advertised = read_u16(buf + after_question + 3);
+        const uint16_t rdlength = read_u16(buf + after_question + 9);
+        if (after_question + 11 + rdlength > len) return ParseError::MalformedOpt;
+        // Capped at 1232 bytes even if the client asks for more: larger UDP
+        // replies get split into IP fragments, which some networks drop and
+        // which have been used to forge DNS answers. Anything bigger is sent
+        // as "truncated", and the client retries over TCP. (1232 is the
+        // DNS Flag Day 2020 recommendation.)
+        udp_limit = advertised < 512 ? 512 : (advertised > 1232 ? 1232 : advertised);
+    }
+
     out.id = read_u16(buf);
     out.flags = flags;
+    out.udp_limit = udp_limit;
     out.name = std::move(name);
     out.qtype = read_u16(buf + pos);
     out.qclass = read_u16(buf + pos + 2);
@@ -86,6 +106,7 @@ const char* parse_error_text(ParseError e) {
         case ParseError::UnexpectedRecords: return "query contains answer/authority records";
         case ParseError::MalformedName:     return "malformed name";
         case ParseError::Truncated:         return "question truncated (no QTYPE/QCLASS)";
+        case ParseError::MalformedOpt:      return "malformed EDNS (OPT) record";
     }
     return "unknown error";
 }

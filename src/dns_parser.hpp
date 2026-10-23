@@ -17,6 +17,9 @@ struct DnsQuery {
     uint16_t qtype = 0;
     uint16_t qclass = 0;
     std::size_t question_end = 0;   // offset just past QCLASS
+    // Largest UDP reply this client accepts: 512 bytes by default, or the
+    // size it advertised in an EDNS (OPT) record, clamped to 512-1232.
+    std::size_t udp_limit = 512;
 };
 
 enum class ParseError {
@@ -28,6 +31,7 @@ enum class ParseError {
     UnexpectedRecords,   // a query carrying answer/authority records
     MalformedName,       // bad label length, overrun, bad characters, too long
     Truncated,           // name ends before QTYPE/QCLASS
+    MalformedOpt,        // EDNS (OPT) record runs past the end of the packet
 };
 
 ParseError parse_query(const uint8_t* buf, std::size_t len, DnsQuery& out);
